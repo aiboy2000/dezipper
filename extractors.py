@@ -174,18 +174,35 @@ class ZipExtractor(BaseExtractor):
                 
                 if extract_flat:
                     # 扁平化提取
-                    def extract_single_zip(member, target_path):
+                    def extract_single_zip(member, target_path: Path): # target_path の型ヒント追加
                         ensure_directory_exists(target_path.parent)
-                        with zip_ref.open(member) as source, open(target_path, 'wb') as target:
+
+                        path_to_open_str = str(target_path)
+                        if os.name == 'nt':
+                            # resolve() は既に ensure_directory_exists で呼ばれているかもしれないが、念のため
+                            # ただし、ファイルパスなので resolve() ではなく abspath() が適切か。
+                            # final_path は既に avoid_filename_conflict を通って絶対パスになっている想定。
+                            abs_path_str = str(target_path.resolve()) if target_path.is_absolute() else str(Path(os.path.abspath(str(target_path))).resolve())
+
+                            if len(abs_path_str) >= 240 and not abs_path_str.startswith('\\\\?\\'):
+                                path_to_open_str = '\\\\?\\' + abs_path_str
+
+                        with zip_ref.open(member) as source, open(path_to_open_str, 'wb') as target:
                             shutil.copyfileobj(source, target)
                     
                     return self.extract_files_flat(members, extract_to, extract_single_zip)
                 else:
                     # 保持结构提取
-                    def extract_single_zip(member, target_path):
+                    def extract_single_zip(member, target_path: Path): # target_path の型ヒント追加
                         ensure_directory_exists(target_path.parent)
                         if not member.is_dir():
-                            with zip_ref.open(member) as source, open(target_path, 'wb') as target:
+                            path_to_open_str = str(target_path)
+                            if os.name == 'nt':
+                                abs_path_str = str(target_path.resolve()) if target_path.is_absolute() else str(Path(os.path.abspath(str(target_path))).resolve())
+                                if len(abs_path_str) >= 240 and not abs_path_str.startswith('\\\\?\\'):
+                                    path_to_open_str = '\\\\?\\' + abs_path_str
+
+                            with zip_ref.open(member) as source, open(path_to_open_str, 'wb') as target:
                                 shutil.copyfileobj(source, target)
                     
                     return self.extract_files_with_structure(members, extract_to, extract_single_zip)
@@ -306,9 +323,21 @@ class SevenZipExtractor(BaseExtractor):
                                 z.extract(targets=[info.filename], path=final_path.parent)
                                 
                                 # 移动到最终位置（如果需要重命名）
-                                extracted_file = final_path.parent / info.filename
+                                extracted_file = final_path.parent / info.filename # これはPathオブジェクト
                                 if extracted_file != final_path:
-                                    shutil.move(str(extracted_file), str(final_path))
+                                    src_path_str = str(extracted_file)
+                                    dst_path_str = str(final_path)
+                                    if os.name == 'nt':
+                                        # shutil.move の src と dst の両方にプレフィックスを試す
+                                        abs_src_path_str = str(extracted_file.resolve()) if extracted_file.is_absolute() else str(Path(os.path.abspath(str(extracted_file))).resolve())
+                                        abs_dst_path_str = str(final_path.resolve()) if final_path.is_absolute() else str(Path(os.path.abspath(str(final_path))).resolve())
+
+                                        if len(abs_src_path_str) >= 240 and not abs_src_path_str.startswith('\\\\?\\'):
+                                            src_path_str = '\\\\?\\' + abs_src_path_str
+                                        if len(abs_dst_path_str) >= 240 and not abs_dst_path_str.startswith('\\\\?\\'):
+                                            dst_path_str = '\\\\?\\' + abs_dst_path_str
+
+                                    shutil.move(src_path_str, dst_path_str)
                                 
                                 extracted_count += 1
                                 
@@ -340,20 +369,30 @@ class TarExtractor(BaseExtractor):
                 
                 if extract_flat:
                     # 扁平化提取
-                    def extract_single_tar(member, target_path):
+                    def extract_single_tar(member, target_path: Path): # target_path の型ヒント追加
                         if member.isfile():
                             ensure_directory_exists(target_path.parent)
-                            with tar_ref.extractfile(member) as source, open(target_path, 'wb') as target:
+                            path_to_open_str = str(target_path)
+                            if os.name == 'nt':
+                                abs_path_str = str(target_path.resolve()) if target_path.is_absolute() else str(Path(os.path.abspath(str(target_path))).resolve())
+                                if len(abs_path_str) >= 240 and not abs_path_str.startswith('\\\\?\\'):
+                                    path_to_open_str = '\\\\?\\' + abs_path_str
+                            with tar_ref.extractfile(member) as source, open(path_to_open_str, 'wb') as target:
                                 shutil.copyfileobj(source, target)
                     
                     return self.extract_files_flat(members, extract_to, extract_single_tar)
                 else:
                     # 保持结构提取（安全检查）
-                    def extract_single_tar(member, target_path):
-                        if not (member.name.startswith('/') or '..' in member.name):
+                    def extract_single_tar(member, target_path: Path): # target_path の型ヒント追加
+                        if not (member.name.startswith('/') or '..' in member.name): # 安全チェック
                             if member.isfile():
                                 ensure_directory_exists(target_path.parent)
-                                with tar_ref.extractfile(member) as source, open(target_path, 'wb') as target:
+                                path_to_open_str = str(target_path)
+                                if os.name == 'nt':
+                                    abs_path_str = str(target_path.resolve()) if target_path.is_absolute() else str(Path(os.path.abspath(str(target_path))).resolve())
+                                    if len(abs_path_str) >= 240 and not abs_path_str.startswith('\\\\?\\'):
+                                        path_to_open_str = '\\\\?\\' + abs_path_str
+                                with tar_ref.extractfile(member) as source, open(path_to_open_str, 'wb') as target:
                                     shutil.copyfileobj(source, target)
                     
                     return self.extract_files_with_structure(members, extract_to, extract_single_tar)

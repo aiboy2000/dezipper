@@ -128,9 +128,27 @@ def ensure_directory_exists(directory_path):
         bool: 是否成功创建或目录已存在
     """
     try:
-        Path(directory_path).mkdir(parents=True, exist_ok=True)
+        path_obj = Path(directory_path)
+        # Windowsの場合、長いパスに対応するために \\?\ プレフィックスを試す
+        if os.name == 'nt':
+            path_str = str(path_obj.resolve()) # resolve() で絶対パスにし、シンボリックリンクも解決
+            # MAX_PATHに近い長さの場合にプレフィックスを付与
+            # Python 3.6+ で LongPathsEnabled が有効なら不要な場合もあるが、互換性のため
+            if len(path_str) >= 240: # 260より少し手前で予防的に
+                if not path_str.startswith('\\\\?\\'):
+                    # 既に \\?\ が付いている場合は何もしない (resolve() が返す可能性は低いが念のため)
+                    # abspath を使ってから \\?\ を付けるのが一般的
+                    # ただし Path.resolve() が既に適切な絶対パスを返していることを期待
+                    path_to_create_str = '\\\\?\\' + path_str
+                    Path(path_to_create_str).mkdir(parents=True, exist_ok=True)
+                    return True
+
+        # 通常の処理 (Windowsで短いパスの場合、または非Windows OSの場合)
+        path_obj.mkdir(parents=True, exist_ok=True)
         return True
-    except Exception:
+    except Exception as e:
+        # エラーログは呼び出し元で出すか、ここで出すか選択
+        # print(f"Error creating directory {directory_path}: {e}")
         return False
 
 
