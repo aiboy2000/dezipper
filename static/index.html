@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Batch Extractor GUI</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
+        .container { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        h1 { color: #333; text-align: center; }
+        label { display: block; margin-bottom: 8px; font-weight: bold; }
+        input[type="text"], button, select {
+            width: calc(100% - 22px); padding: 10px; margin-bottom: 15px; border-radius: 4px; border: 1px solid #ddd;
+            box-sizing: border-box;
+        }
+        input[type="checkbox"] { margin-right: 5px; }
+        .options div { margin-bottom: 10px; }
+        button { background-color: #007bff; color: white; font-size: 16px; cursor: pointer; border: none; }
+        button:hover { background-color: #0056b3; }
+        button:disabled { background-color: #ccc; cursor: not-allowed; }
+        #result { margin-top: 20px; padding: 15px; border: 1px solid #eee; border-radius: 4px; background-color: #e9ecef; max-height: 400px; overflow-y: auto; }
+        #result h3 { margin-top: 0; }
+        #result pre { white-space: pre-wrap; word-wrap: break-word; font-size: 0.9em; }
+        .log-entry { padding: 2px 0; border-bottom: 1px dotted #ccc; }
+        .log-entry:last-child { border-bottom: none; }
+        .log-INFO { color: #333; }
+        .log-SUCCESS { color: green; font-weight: bold; }
+        .log-WARNING { color: orange; }
+        .log-ERROR { color: red; font-weight: bold; }
+        .spinner {
+            border: 4px solid #f3f3f3; /* Light grey */
+            border-top: 4px solid #3498db; /* Blue */
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            margin: 10px auto;
+            display: none; /* Hidden by default */
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Batch Extractor</h1>
+
+        <div>
+            <label for="directory">Target Directory:</label>
+            <input type="text" id="directory" name="directory" placeholder="/path/to/your/archives">
+        </div>
+
+        <div class="options">
+            <h3>Options:</h3>
+            <div>
+                <input type="checkbox" id="create_backup" name="create_backup" checked>
+                <label for="create_backup" style="display: inline;">Create Backup</label>
+            </div>
+            <div>
+                <input type="checkbox" id="delete_original" name="delete_original" checked>
+                <label for="delete_original" style="display: inline;">Delete Original Archive After Extraction</label>
+            </div>
+            <div>
+                <input type="checkbox" id="preserve_structure" name="preserve_structure" checked>
+                <label for="preserve_structure" style="display: inline;">Preserve Directory Structure</label>
+            </div>
+            <div>
+                <input type="checkbox" id="extract_flat" name="extract_flat">
+                <label for="extract_flat" style="display: inline;">Extract Flat (Ignore Folders, Extract Files Only)</label>
+            </div>
+        </div>
+
+        <button id="extractButton">Start Extraction</button>
+        <div id="spinner" class="spinner"></div>
+
+        <div id="result">
+            <h3>Results:</h3>
+            <pre id="resultText">Awaiting extraction...</pre>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('extractButton').addEventListener('click', async function() {
+            const directory = document.getElementById('directory').value;
+            if (!directory) {
+                alert('Please enter a target directory.');
+                return;
+            }
+
+            const createBackup = document.getElementById('create_backup').checked;
+            const deleteOriginal = document.getElementById('delete_original').checked;
+            const preserveStructure = document.getElementById('preserve_structure').checked;
+            const extractFlat = document.getElementById('extract_flat').checked;
+
+            const resultText = document.getElementById('resultText');
+            const extractButton = document.getElementById('extractButton');
+            const spinner = document.getElementById('spinner');
+
+            resultText.innerHTML = 'Processing...';
+            extractButton.disabled = true;
+            spinner.style.display = 'block';
+
+            try {
+                const response = await fetch('/extract', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        directory: directory,
+                        create_backup: createBackup,
+                        delete_original: deleteOriginal,
+                        preserve_structure: preserveStructure,
+                        extract_flat: extractFlat,
+                    }),
+                });
+
+                const data = await response.json();
+                let output = `<strong>Status: ${response.ok ? 'Success' : 'Error'}</strong>\n`;
+                output += `Message: ${data.message || (response.ok ? 'Completed' : data.detail || 'Unknown error')}\n\n`;
+
+                if (data.stats) {
+                    output += "<strong>Stats:</strong>\n";
+                    for (const key in data.stats) {
+                        output += `  ${key}: ${data.stats[key]}\n`;
+                    }
+                    output += "\n";
+                }
+
+                if (data.logs && data.logs.length > 0) {
+                    output += "<strong>Logs:</strong>\n";
+                    data.logs.forEach(log => {
+                        let level = "INFO"; // Default
+                        if (log.startsWith("[SUCCESS]")) level = "SUCCESS";
+                        else if (log.startsWith("[ERROR]")) level = "ERROR";
+                        else if (log.startsWith("[WARNING]")) level = "WARNING";
+                        else if (log.startsWith("[INFO]")) level = "INFO";
+                        // Simple parsing for log level for coloring
+                        output += `<div class="log-entry log-${level}">${log.replace(/\[.*?\]\s*/, '')}</div>`;
+
+                    });
+                }
+                resultText.innerHTML = output;
+
+            } catch (error) {
+                resultText.textContent = `An error occurred: ${error.message}\n\nIs the API server running?`;
+                console.error("Fetch error:", error);
+            } finally {
+                extractButton.disabled = false;
+                spinner.style.display = 'none';
+            }
+        });
+    </script>
+</body>
+</html>

@@ -28,19 +28,26 @@ except ImportError:
 class BaseExtractor:
     """基础解压器类"""
     
-    def __init__(self, logger=None):
-        self.logger = logger
+    def __init__(self, log_method=None): # logger を log_method に変更
+        self.log_method = log_method # print のような関数を想定
         self.extracted_count = 0
     
+    def _log(self, message, level="INFO"):
+        """Log using the provided log_method."""
+        if self.log_method:
+            self.log_method(message, level)
+        # else: # フォールバックとして print も可能だが、基本は log_method が渡される前提
+            # print(f"[{level}] {message}")
+
+    # log_info と log_warning は _log を使うように変更
     def log_info(self, message):
         """记录信息日志"""
-        if self.logger:
-            self.logger.info(message)
+        self._log(message, "INFO")
     
     def log_warning(self, message):
         """记录警告日志"""
-        if self.logger:
-            self.logger.warning(f"⚠️ {message}")
+        # 警告メッセージにプレフィックスは log_method 側で統一されていれば不要
+        self._log(message, "WARNING") # BatchExtractor._log がプレフィックスを付ける
     
     def extract_files_flat(self, members, extract_to, extract_func):
         """扁平化提取文件（只要文件，不要文件夹结构）"""
@@ -300,13 +307,13 @@ class TarExtractor(BaseExtractor):
 
 
 # 解压器工厂函数
-def get_extractor(file_extension, logger=None):
+def get_extractor(file_extension, log_method=None): # logger を log_method に変更
     """
     根据文件扩展名获取对应的解压器
     
     Args:
         file_extension: 文件扩展名
-        logger: 日志记录器
+        log_method: ログ出力用のメソッド (例: BatchExtractor._log)
         
     Returns:
         BaseExtractor: 解压器实例
@@ -326,6 +333,6 @@ def get_extractor(file_extension, logger=None):
     
     extractor_class = extractors.get(file_extension)
     if extractor_class:
-        return extractor_class(logger)
+        return extractor_class(log_method=log_method) # logger を log_method に変更
     else:
         raise ValueError(f"不支持的文件格式: {file_extension}")
