@@ -11,16 +11,31 @@ import tarfile
 from pathlib import Path
 from utils import safe_filename, avoid_filename_conflict, ensure_directory_exists
 
+import shutil # shutil をインポート
+
+from config import SEVENZ_EXE_PATH as CFG_SEVENZ_EXE_PATH # configからインポート
+
 # 可选依赖检查
-try:
-    import rarfile
+# RAR_AVAILABLE は rarfile ではなく 7z.exe の存在で判定するように変更
+
+# まず config から SEVENZ_EXE_PATH を試す
+resolved_sevenz_path = None
+if CFG_SEVENZ_EXE_PATH and shutil.which(CFG_SEVENZ_EXE_PATH): # 指定があり、かつ実行可能か
+    resolved_sevenz_path = CFG_SEVENZ_EXE_PATH
+else: # 指定がないか、指定されたパスが見つからない/実行不可の場合、PATHから探す
+    resolved_sevenz_path = shutil.which("7z") or shutil.which("7z.exe")
+
+if resolved_sevenz_path:
     RAR_AVAILABLE = True
-except ImportError:
+    SEVENZ_PATH = resolved_sevenz_path # 実際に使用する7zのパス
+else:
     RAR_AVAILABLE = False
+    SEVENZ_PATH = None
 
 try:
     import py7zr
-    SEVENZ_AVAILABLE = True
+    SEVENZ_AVAILABLE = True # これはpy7zrライブラリに依存する7z形式の処理用なので残す
+                           # もし7z形式も7z.exeで統一するなら、このフラグもSEVENZ_PATHで判定する
 except ImportError:
     SEVENZ_AVAILABLE = False
 
@@ -181,44 +196,85 @@ class ZipExtractor(BaseExtractor):
             raise Exception(f"ZIP解压失败: {str(e)}")
 
 
+import subprocess # subprocess をインポート
+
 class RarExtractor(BaseExtractor):
-    """RAR文件解压器"""
+    """RAR文件解压器 (7z.exe を使用)"""
     
-    def extract(self, archive_path, extract_to, extract_flat=False):
-        """解压RAR文件"""
-        if not RAR_AVAILABLE:
-            raise Exception("RAR支持未安装，请使用: pip install rarfile")
-            
+    def extract(self, archive_path, extract_to, extract_flat=False): # extract_flat は7z.exeでは直接制御しにくい
+        """使用7z.exe解压RAR文件"""
+        if not RAR_AVAILABLE or not SEVENZ_PATH:
+            # このメッセージは実質的に「7z.exeが見つかりません」となる
+            raise Exception("7-Zip (7z.exe) not found. Please install 7-Zip and ensure it's in your PATH.")
+
+        archive_path_str = str(archive_path)
+        extract_to_str = str(extract_to)
+
+        # 7z.exe のコマンドを構築
+        # x: eXtract with full paths (フルパスで展開)
+        # -y: Assume Yes on all queries (すべて上書き)
+        # -o: Set Output directory (出力先指定。-o とパスの間にスペースなし)
+        cmd = [SEVENZ_PATH, 'x', archive_path_str, f'-o{extract_to_str}', '-y']
+
+        # extract_flat の考慮:
+        # 7z.exe の 'e' コマンドはフラット展開だが、サブディレクトリ内の同名ファイルは上書きされる可能性がある。
+        # 安全のため、'x' で構造通り展開後、必要ならPython側でファイルを移動する方が確実だが、複雑になる。
+        # ここでは extract_flat が True の場合、'e' コマンドを使用する試みを行う。
+        # ただし、7z.exe 'e' の挙動（特にサブディレクトリの扱い）は注意が必要。
+        # BaseExtractorのextract_files_flatのような柔軟な処理は難しい。
+        # 今回は extract_flat は無視し、常に構造を保持して展開するか、
+        # または 'e' コマンドで試みるが、限定的なサポートとなることを許容する。
+        # シンプルにするため、今回は extract_flat を直接サポートせず、常に 'x' を使用する。
+        # もし extract_flat が重要な場合は、展開後にPythonでファイルを移動する処理を追加する必要がある。
+        if extract_flat:
+            self.log_method("RAR extraction with 7z.exe: 'extract_flat' is requested, but 7z.exe 'x' command will preserve structure. For true flat extraction, manual post-processing might be needed or use 'e' command with caution.", "WARNING")
+            # 代替として 'e' コマンドを使う場合:
+            # cmd = [SEVENZ_PATH, 'e', archive_path_str, f'-o{extract_to_str}', '-y']
+            # ただし、この場合 BaseExtractor の extract_files_flat のようなファイルごとの処理はできない。
+
+        self.log_method(f"Attempting to extract RAR (using 7z.exe): {archive_path_str} to {extract_to_str}", "INFO")
+        self.log_method(f"Executing command: {' '.join(cmd)}", "DEBUG")
+
         try:
-            with rarfile.RarFile(archive_path, 'r') as rar_ref:
-                # 检查是否需要密码
-                if rar_ref.needs_password():
-                    raise Exception("RAR文件有密码保护，无法解压")
-                
-                members = rar_ref.infolist()
-                
-                if extract_flat:
-                    # 扁平化提取
-                    def extract_single_rar(member, target_path):
-                        ensure_directory_exists(target_path.parent)
-                        with rar_ref.open(member) as source, open(target_path, 'wb') as target:
-                            shutil.copyfileobj(source, target)
-                    
-                    return self.extract_files_flat(members, extract_to, extract_single_rar)
-                else:
-                    # 保持结构提取
-                    def extract_single_rar(member, target_path):
-                        ensure_directory_exists(target_path.parent)
-                        if not member.is_dir():
-                            with rar_ref.open(member) as source, open(target_path, 'wb') as target:
-                                shutil.copyfileobj(source, target)
-                    
-                    return self.extract_files_with_structure(members, extract_to, extract_single_rar)
-                
-        except rarfile.BadRarFile:
-            raise Exception("RAR文件已损坏或格式不正确")
+            process = subprocess.run(cmd, capture_output=True, text=True, check=False, encoding='utf-8', errors='replace')
+
+            if process.stdout:
+                self.log_method(f"7z stdout:\n{process.stdout}", "DEBUG")
+            if process.stderr:
+                # 7zはエラーでなくてもstderrに情報を出すことがある (例: "Everything is Ok")
+                # そのため、終了コードも併せて判断する
+                self.log_method(f"7z stderr:\n{process.stderr}", "DEBUG" if process.returncode == 0 else "ERROR")
+
+            if process.returncode != 0:
+                # エラーコードの詳細は7zのドキュメント参照
+                # 1: Warning (non-critical error)
+                # 2: Fatal error
+                # 7: Command line error
+                # 8: Not enough memory
+                # 255: User stopped the process
+                error_message = f"7z.exe failed with return code {process.returncode}."
+                if "password" in process.stderr.lower() or "cannot open encrypted archive" in process.stderr.lower() :
+                     error_message = "RAR file seems to be password protected. 7z.exe cannot extract it without a password."
+                elif "cannot open file as archive" in process.stderr.lower():
+                     error_message = "File is not a valid RAR archive or is corrupted."
+                self.log_method(error_message, "ERROR")
+                raise Exception(error_message)
+
+            self.log_method(f"RAR file extracted successfully (using 7z.exe): {archive_path_str}", "SUCCESS")
+            # extracted_count はアーカイブ単位で1とする。
+            # 正確なファイル数を取るには `7z l -ba <archive>` を事前実行しパースする必要がある。
+            return 1
+
+        except FileNotFoundError:
+            self.log_method(f"7z.exe not found at {SEVENZ_PATH}. Please ensure 7-Zip is installed and in your PATH.", "ERROR")
+            raise Exception(f"7z.exe not found at {SEVENZ_PATH}.")
+        except subprocess.CalledProcessError as e: # check=True の場合だが、今回はFalseなのでここには来ないはず
+            self.log_method(f"7z.exe execution failed: {e.stderr}", "ERROR")
+            raise Exception(f"RAR extraction failed using 7z.exe: {e.stderr}")
         except Exception as e:
-            raise Exception(f"RAR解压失败: {str(e)}")
+            self.log_method(f"An unexpected error occurred during RAR extraction with 7z.exe: {str(e)}", "ERROR")
+            # raise e # 元の例外をそのまま投げるか、カスタム例外を投げる
+            raise Exception(f"RAR extraction failed: {str(e)}")
 
 
 class SevenZipExtractor(BaseExtractor):

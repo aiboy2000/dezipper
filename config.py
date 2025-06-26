@@ -45,3 +45,8 @@ STATS_FIELDS = [
     'freed_size',      # 释放的磁盘空间
     'extracted_files'  # 提取的文件总数
 ]
+
+# 7z.exe のパス (指定がない場合はPATH環境変数から探す)
+# 例: "C:/Program Files/7-Zip/7z.exe" や "/usr/bin/7z"
+# 空文字列またはNoneの場合、shutil.whichで探す
+SEVENZ_EXE_PATH = ""
