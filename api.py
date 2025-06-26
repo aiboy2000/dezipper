@@ -169,8 +169,8 @@ class BatchExtractor:
 
             # get_extractor は同期的だが、Extractorのメソッドを非同期対応にするか、
             # to_threadでラップする
-            # logger を self._log メソッドに変更
-            extractor_instance = get_extractor(file_ext, log_method=self._log)
+            # logger を self._log メソッドに変更し、file_logger として self.logger を渡す
+            extractor_instance = get_extractor(file_ext, log_method=self._log, file_logger=self.logger)
 
             # extractor.extract を非同期化するか、to_threadでラップ
             # ここでは extractor.extract がブロッキングであると仮定

@@ -28,8 +28,9 @@ except ImportError:
 class BaseExtractor:
     """基础解压器类"""
     
-    def __init__(self, log_method=None): # logger を log_method に変更
+    def __init__(self, log_method=None, file_logger=None): # file_logger を追加
         self.log_method = log_method # print のような関数を想定
+        self.file_logger = file_logger # ファイル出力用の標準ロガー
         self.extracted_count = 0
     
     def _log(self, message, level="INFO"):
@@ -69,7 +70,7 @@ class BaseExtractor:
                     continue
                 
                 # 处理文件名乱码和非法字符
-                safe_name = safe_filename(filename, self.logger)
+                safe_name = safe_filename(filename, self.file_logger) # self.logger を self.file_logger に変更
                 
                 # 避免文件名冲突
                 final_path = avoid_filename_conflict(extract_to / safe_name)
@@ -100,7 +101,8 @@ class BaseExtractor:
                 
                 # 处理路径中的乱码
                 path_parts = member_name.split('/')
-                safe_path_parts = [safe_filename(part, self.logger) for part in path_parts if part]
+                # self.logger を self.file_logger に変更
+                safe_path_parts = [safe_filename(part, self.file_logger) for part in path_parts if part]
                 safe_path = '/'.join(safe_path_parts)
                 
                 if not safe_path:
@@ -307,13 +309,14 @@ class TarExtractor(BaseExtractor):
 
 
 # 解压器工厂函数
-def get_extractor(file_extension, log_method=None): # logger を log_method に変更
+def get_extractor(file_extension, log_method=None, file_logger=None): # file_logger を追加
     """
     根据文件扩展名获取对应的解压器
     
     Args:
         file_extension: 文件扩展名
         log_method: ログ出力用のメソッド (例: BatchExtractor._log)
+        file_logger: ファイル出力用の標準ロガー
         
     Returns:
         BaseExtractor: 解压器实例
@@ -333,6 +336,7 @@ def get_extractor(file_extension, log_method=None): # logger を log_method に�
     
     extractor_class = extractors.get(file_extension)
     if extractor_class:
-        return extractor_class(log_method=log_method) # logger を log_method に変更
+        # log_method と file_logger の両方を渡す
+        return extractor_class(log_method=log_method, file_logger=file_logger)
     else:
         raise ValueError(f"不支持的文件格式: {file_extension}")
