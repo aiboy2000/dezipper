@@ -155,23 +155,33 @@ class BaseExtractor:
         # ZIPファイルでUTF-8フラグが立っていない場合、エンコーディング問題の可能性がある
         # member_name_raw が str 型で、かつそれが誤デコードされた結果かもしれない
         if isinstance(member_name_raw, str) and hasattr(member, 'flag_bits') and not (member.flag_bits & 0x800):
-            # member.filename (str) を latin-1 でバイト列に戻し、再デコードを試みる
-            # これは、元のバイト列が latin-1 (あるいは他の1バイトエンコーディング) で誤って解釈されたと仮定
+            # 推定される元のエンコーディングでバイト列に戻す試み
+            # Windowsの場合は 'mbcs' (システムのANSIコードページ)、その他はファイルシステムエンコーディング
+            assumed_original_encoding = 'mbcs' if os.name == 'nt' else sys.getfilesystemencoding()
             try:
-                filename_bytes_candidate = member_name_raw.encode('latin-1')
-                log_message_reencode = f"BaseExtractor._get_member_name: ZIP member, non-UTF8 flag. Re-encoded to bytes via latin-1: {filename_bytes_candidate!r}"
-                if self.log_method:
-                    self.log_method(log_message_reencode, "DEBUG")
-                elif self.file_logger:
-                    self.file_logger.debug(log_message_reencode)
+                # errors='surrogateescape' を使うことで、変換不能な文字があってもエラーにせず特殊なUnicode文字として保持し、
+                # 再度同じエンコーディングでデコードする際に元のバイトに戻せる可能性がある。
+                filename_bytes_candidate = member_name_raw.encode(assumed_original_encoding, errors='surrogateescape')
+
+                log_message_reencode = (
+                    f"BaseExtractor._get_member_name: ZIP member, non-UTF8 flag. "
+                    f"Attempting to re-encode str to bytes using '{assumed_original_encoding}' (with surrogateescape). "
+                    f"Original str: {member_name_raw!r}, Candidate bytes: {filename_bytes_candidate!r}"
+                )
+                if self.log_method: self.log_method(log_message_reencode, "DEBUG")
+                elif self.file_logger: self.file_logger.debug(log_message_reencode)
+
                 # safe_filename にはこのバイト列候補を渡す
                 return filename_bytes_candidate
+
             except Exception as e_reencode:
-                log_message_reencode_fail = f"BaseExtractor._get_member_name: Failed to re-encode suspected mis-decoded str via latin-1: {e_reencode}. Proceeding with original str."
-                if self.log_method:
-                    self.log_method(log_message_reencode_fail, "WARNING")
-                elif self.file_logger:
-                    self.file_logger.warning(log_message_reencode_fail)
+                log_message_reencode_fail = (
+                    f"BaseExtractor._get_member_name: Failed to re-encode mis-decoded str via '{assumed_original_encoding}' (surrogateescape): {e_reencode}. "
+                    f"Proceeding with original (potentially garbled) str: {member_name_raw!r}"
+                )
+                if self.log_method: self.log_method(log_message_reencode_fail, "WARNING")
+                elif self.file_logger: self.file_logger.warning(log_message_reencode_fail)
+
                 # 失敗した場合は元の (おそらく文字化けした) 文字列をそのまま返す
                 return member_name_raw
 
@@ -247,6 +257,7 @@ class ZipExtractor(BaseExtractor):
 
 
 import subprocess # subprocess をインポート
+import sys # sys をインポート
 
 class RarExtractor(BaseExtractor):
     """RAR文件解压器 (7z.exe を使用)"""

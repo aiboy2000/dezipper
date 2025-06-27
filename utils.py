@@ -36,54 +36,120 @@ def safe_filename(filename, logger=None):
     Returns:
         str: 安全的文件名
     """
+import sys # sysモジュールをインポート
+
+def _is_ascii_only(s: str) -> bool:
+    """文字列がASCII文字のみで構成されているかチェック"""
+    return all(ord(c) < 128 for c in s)
+
+def _try_decode_bytes(byte_sequence, logger=None):
+    """指定されたバイトシーケンスに対してchardetとENCODING_ORDERでデコードを試みるヘルパー関数"""
+    decoded_str = None
+    if logger:
+        logger.debug(f"_try_decode_bytes: Attempting to decode byte sequence: {byte_sequence!r}")
+
+    # 1. chardet
+    detected_info = chardet.detect(byte_sequence)
+    if logger:
+        logger.debug(f"_try_decode_bytes: chardet.detect result: {detected_info}")
+    if detected_info and detected_info['encoding'] and detected_info['confidence'] > 0.7:
+        try:
+            decoded_str = byte_sequence.decode(detected_info['encoding'])
+            if logger:
+                logger.debug(f"_try_decode_bytes: Decoded as '{detected_info['encoding']}' by chardet (conf: {detected_info['confidence']:.2f}). Result: {decoded_str!r}")
+            return decoded_str # 成功したら返す
+        except (UnicodeDecodeError, UnicodeError, LookupError) as e:
+            if logger:
+                logger.debug(f"_try_decode_bytes: Chardet detected '{detected_info['encoding']}' but decoding failed: {e}")
+            decoded_str = None
+
+    # 2. ENCODING_ORDER
+    if decoded_str is None:
+        if logger:
+            logger.debug(f"_try_decode_bytes: chardet failed or low confidence. Trying ENCODING_ORDER: {ENCODING_ORDER}")
+        for enc in ENCODING_ORDER:
+            try:
+                decoded_str = byte_sequence.decode(enc)
+                if logger:
+                    logger.debug(f"_try_decode_bytes: Successfully decoded as '{enc}' from ENCODING_ORDER. Result: {decoded_str!r}")
+                return decoded_str # 成功したら返す
+            except (UnicodeDecodeError, UnicodeError):
+                if logger:
+                    logger.debug(f"_try_decode_bytes: Failed to decode as '{enc}'.")
+                continue
+        else: # ループがbreakしなかった場合
+            if logger:
+                logger.warning(f"_try_decode_bytes: All ENCODING_ORDER attempts failed for byte string. Original bytes: {byte_sequence!r}")
+            # ここではNoneを返す (呼び出し元で最終フォールバック処理)
+            return None
+    return None # chardet成功時以外でここに到達しないはずだが念のため
+
+def safe_filename(filename, logger=None):
+    """
+    处理可能包含非法字符或乱码的文件名
+
+    Args:
+        filename: 原始文件名
+        logger: 可选的日志记录器
+
+    Returns:
+        str: 安全的文件名
+    """
     if logger:
         logger.debug(f"safe_filename: Received raw filename: {filename!r} (type: {type(filename)})")
 
     try:
-        filename_str = None # デコード後の文字列を格納する変数
+        filename_str = None
+
         if isinstance(filename, bytes):
-            # 1. chardet でエンコーディングを試す
-            if logger:
-                logger.debug(f"safe_filename: Input is bytes. Attempting chardet on: {filename!r}")
-            detected_info = chardet.detect(filename)
-            if logger:
-                logger.debug(f"safe_filename: chardet.detect result: {detected_info}")
-
-            if detected_info and detected_info['encoding'] and detected_info['confidence'] > 0.7:
-                try:
-                    filename_str = filename.decode(detected_info['encoding'])
-                    if logger:
-                        logger.debug(f"safe_filename: Decoded as '{detected_info['encoding']}' by chardet (conf: {detected_info['confidence']:.2f}). Result: {filename_str!r}")
-                except (UnicodeDecodeError, UnicodeError, LookupError) as e:
-                    if logger:
-                        logger.debug(f"safe_filename: Chardet detected '{detected_info['encoding']}' but decoding failed: {e}")
-                    filename_str = None # デコード失敗、次のステップへ
-
-            # 2. chardetでデコードできなかった場合、または信頼度が低い場合、ENCODING_ORDERで試す
-            if filename_str is None:
+            filename_str = _try_decode_bytes(filename, logger)
+            if filename_str is None: # _try_decode_bytes がNoneを返した場合 (全てのデコード失敗)
                 if logger:
-                    logger.debug(f"safe_filename: chardet decoding failed or low confidence. Trying ENCODING_ORDER: {ENCODING_ORDER}")
-                for enc in ENCODING_ORDER:
-                    try:
-                        filename_str = filename.decode(enc)
-                        if logger:
-                            logger.debug(f"safe_filename: Successfully decoded as '{enc}' from ENCODING_ORDER. Result: {filename_str!r}")
-                        break # 成功したらループを抜ける
-                    except (UnicodeDecodeError, UnicodeError):
-                        if logger:
-                            logger.debug(f"safe_filename: Failed to decode as '{enc}'.")
-                        continue # 次のエンコーディングを試す
-                else: # forループがbreakしなかった場合 (全てのENCODING_ORDERで失敗)
-                    if logger:
-                        logger.warning(f"safe_filename: All ENCODING_ORDER attempts failed for byte string. Falling back to utf-8 with 'replace'. Original bytes: {filename!r}")
-                    filename_str = filename.decode('utf-8', errors='replace')
-        
+                    logger.warning(f"safe_filename: Decoding byte input failed completely. Falling back to utf-8 with 'replace'. Original bytes: {filename!r}")
+                filename_str = filename.decode('utf-8', errors='replace')
+
         elif isinstance(filename, str):
-            if logger:
-                logger.debug(f"safe_filename: Input is already str: {filename!r}")
-            filename_str = filename
-        
-        else: # bytesでもstrでもない場合 (通常ありえないが念のため)
+            if _is_ascii_only(filename):
+                if logger:
+                    logger.debug(f"safe_filename: Input is ASCII-only str: {filename!r}. Skipping advanced decoding attempts.")
+                filename_str = filename
+            else:
+                if logger:
+                    logger.debug(f"safe_filename: Input is non-ASCII str: {filename!r}. Attempting re-encode and decode.")
+
+                # 文字化けしたstrをバイト列に戻すための試行エンコーディングリスト
+                # WindowsのANSIコードページ(mbcs)、zipfileが使うcp437、汎用的なlatin-1など
+                re_encode_candidates = ['mbcs'] if os.name == 'nt' else [sys.getfilesystemencoding()]
+                re_encode_candidates += ['cp437', 'latin-1'] # これらも試す価値あり
+
+                successfully_re_decoded = False
+                for re_enc in re_encode_candidates:
+                    try:
+                        if logger:
+                            logger.debug(f"safe_filename: Trying to re-encode str to bytes using '{re_enc}' (with surrogateescape).")
+                        byte_candidate = filename.encode(re_enc, errors='surrogateescape')
+                        if logger:
+                            logger.debug(f"safe_filename: Re-encoded to bytes: {byte_candidate!r}")
+
+                        # 得られたバイト列候補を再度デコード試行
+                        decoded_from_candidate = _try_decode_bytes(byte_candidate, logger)
+                        if decoded_from_candidate is not None:
+                            filename_str = decoded_from_candidate
+                            successfully_re_decoded = True
+                            if logger:
+                                logger.info(f"safe_filename: Successfully re-decoded str via '{re_enc}' into: {filename_str!r}")
+                            break
+                    except Exception as e_re_enc:
+                        if logger:
+                            logger.debug(f"safe_filename: Failed to re-encode str using '{re_enc}': {e_re_enc}")
+                        continue
+
+                if not successfully_re_decoded:
+                    if logger:
+                        logger.warning(f"safe_filename: Failed to re-decode non-ASCII str. Proceeding with original (potentially garbled) str: {filename!r}")
+                    filename_str = filename # どの試行もうまくいかなければ元のstr
+
+        else: # bytesでもstrでもない場合
             if logger:
                 logger.error(f"safe_filename: Received unexpected type: {type(filename)}. Value: {filename!r}. Converting to string representation.")
             try:
