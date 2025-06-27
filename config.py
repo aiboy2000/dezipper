@@ -43,7 +43,9 @@ STATS_FIELDS = [
     'error',           # 解压失败的文件数
     'total_size',      # 压缩文件总大小
     'freed_size',      # 释放的磁盘空间
-    'extracted_files'  # 提取的文件总数
+    'extracted_files',  # 提取的文件总数 (これはExtractorが報告するアイテム数、フォルダも含む可能性あり)
+    'total_extracted_actual_files', # 実際にディスクに展開されたファイル数 (圧縮ファイル除く)
+    'total_extracted_folders'       # 実際にディスクに展開されたフォルダ数
 ]
 
 # 7z.exe のパス (指定がない場合はPATH環境変数から探す)

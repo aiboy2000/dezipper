@@ -262,6 +262,20 @@ class BatchExtractor:
         if self.delete_original and self.stats['freed_size'] > 0:
             self._log(f"  Space freed: {format_file_size(self.stats['freed_size'])}", "INFO")
 
+        # 新しい統計情報を収集して記録
+        try:
+            actual_files, actual_folders = await self._collect_final_stats(self.work_dir)
+            self.stats['total_extracted_actual_files'] = actual_files
+            self.stats['total_extracted_folders'] = actual_folders
+            self._log(f"  Final actual files count: {actual_files}", "INFO")
+            self._log(f"  Final folders count: {actual_folders}", "INFO")
+        except Exception as e_stats:
+            self._log(f"Error collecting final stats: {e_stats}", "ERROR")
+            # エラーが発生しても、主要な解凍処理は完了しているので、統計情報はデフォルト値のままにするか、エラーを示す値を入れる
+            self.stats.setdefault('total_extracted_actual_files', -1) # エラー時は-1など
+            self.stats.setdefault('total_extracted_folders', -1)
+
+
     async def run(self):
         """主処理を非同期で実行"""
         self._log("Batch Extractor starting...", "INFO")
@@ -299,6 +313,47 @@ class BatchExtractor:
             # スタックトレースをファイルログに出力したい場合
             self.logger.exception("Detailed error during execution:")
             return False, f"An unexpected error occurred: {str(e)}"
+
+    async def _collect_final_stats(self, scan_root_path: Path) -> tuple[int, int]:
+        """
+        指定されたパス内の実際のファイル数（圧縮ファイルを除く）とフォルダ数を収集します。
+        """
+        actual_files_count = 0
+        folders_count = 0
+        self._log(f"Starting final stats collection in: {scan_root_path}", "DEBUG")
+
+        # Path.rglob は非同期ではないため、全体を to_thread でラップするか、
+        # 個々の is_file/is_dir 呼び出しをラップするか。
+        # アイテム数が非常に多い場合を考慮し、rglob自体はメインスレッドで実行し、
+        # stat呼び出しを伴うis_file/is_dirを非同期にする。
+        # しかし、rglobのイテレーション自体がブロッキングになるため、
+        # 大量のファイルがあるディレクトリではUIが固まる可能性を避けるため、
+        # ループ全体をto_threadで実行するのがより安全かもしれない。
+        # ここでは、まず個々のチェックを非同期にするアプローチで試みる。
+
+        items_to_check = list(scan_root_path.rglob('*')) # 一旦リスト化（大量ファイルでメモリ注意）
+                                                       # 非同期ジェネレータ的に扱えると良いが複雑になる
+
+        for item in items_to_check:
+            try:
+                is_file = await asyncio.to_thread(item.is_file)
+                is_dir = await asyncio.to_thread(item.is_dir)
+
+                if is_file:
+                    file_ext = get_file_extension(item) # これは同期的なPath操作
+                    if file_ext not in SUPPORTED_EXTENSIONS:
+                        actual_files_count += 1
+                        self._log(f"  Counted file: {item.relative_to(scan_root_path)}", "DEBUG")
+                    else:
+                        self._log(f"  Skipped (compressed archive): {item.relative_to(scan_root_path)}", "DEBUG")
+                elif is_dir:
+                    folders_count += 1
+                    self._log(f"  Counted folder: {item.relative_to(scan_root_path)}", "DEBUG")
+            except Exception as e:
+                self._log(f"Error processing item {item} during stats collection: {e}", "WARNING")
+
+        self._log(f"Final stats: {actual_files_count} actual files, {folders_count} folders.", "INFO")
+        return actual_files_count, folders_count
 
 app = FastAPI()
 

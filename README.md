@@ -101,7 +101,9 @@ batch_extractor/
             "error": 0,
             "total_size": 102400, // 示例: 字节数
             "freed_size": 51200,  // 示例: 字节数
-            "extracted_files": 10
+            "extracted_files": 10, // Extractorが報告する総アイテム数（フォルダ含む可能性あり）
+            "total_extracted_actual_files": 8, // (新) 実際に展開されたファイル総数（圧縮ファイル除く）
+            "total_extracted_folders": 2     // (新) 実際に展開されたフォルダ総数
         }
     }
     ```
