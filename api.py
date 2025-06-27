@@ -172,22 +172,32 @@ class BatchExtractor:
             # logger を self._log メソッドに変更し、file_logger として self.logger を渡す
             extractor_instance = get_extractor(file_ext, log_method=self._log, file_logger=self.logger)
 
-            # extractor.extract を非同期化するか、to_threadでラップ
-            # ここでは extractor.extract がブロッキングであると仮定
-            extracted_count = await asyncio.to_thread(
-                extractor_instance.extract,
-                archive_path,
-                extract_to,
-                self.extract_flat
-            )
+            extracted_items_count = 0 # 初期化
+            # RarExtractor.extract は同期メソッド、他は async def になっている
+            if file_ext == '.rar': # RarExtractor の場合 (SEVENZ_PATH を使う)
+                extracted_items_count = await asyncio.to_thread(
+                    extractor_instance.extract,
+                    archive_path,
+                    extract_to,
+                    self.extract_flat
+                )
+            else: # ZipExtractor, TarExtractor, SevenZipExtractor (py7zr) の場合
+                extracted_items_count = await extractor_instance.extract(
+                    archive_path,
+                    extract_to,
+                    self.extract_flat
+                )
 
             extraction_success = True
-            self._log(f"Extraction successful, {extracted_count} files/folders extracted.", "SUCCESS")
+            # ログメッセージで extracted_items_count を使用
+            self._log(f"Extraction successful, {extracted_items_count} files/folders reported by extractor.", "SUCCESS")
             self.stats['success'] += 1
-            self.stats['extracted_files'] += extracted_count
+            # self.stats['extracted_files'] は元々 Extractor が報告するアイテム数だったので、これに加算
+            self.stats['extracted_files'] += extracted_items_count
 
         except Exception as e:
-            self._log(f"  Extraction failed: {str(e)}", "ERROR")
+            # エラーログの改善: どのファイルで失敗したかわかるように archive_path を含める
+            self._log(f"  Extraction failed for {archive_path.name}: {str(e)}", "ERROR")
             self.stats['error'] += 1
 
         finally:
