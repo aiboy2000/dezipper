@@ -5,37 +5,35 @@
 """
 
 import os
-import shutil
+import shutil # shutil をインポート (重複を削除し、ここに集約)
 import zipfile
 import tarfile
 from pathlib import Path
-from utils import safe_filename, avoid_filename_conflict, ensure_directory_exists
+import asyncio # asyncio をここにインポート
+import subprocess # subprocess をインポート
+import sys # sys をインポート
 
-import shutil # shutil をインポート
-
-from config import SEVENZ_EXE_PATH as CFG_SEVENZ_EXE_PATH # configからインポート
+from utils import safe_filename, avoid_filename_conflict, ensure_directory_exists, get_file_size
+from config import SEVENZ_EXE_PATH as CFG_SEVENZ_EXE_PATH, SUPPORTED_EXTENSIONS # SUPPORTED_EXTENSIONS もここでインポート
 
 # 可选依赖检查
 # RAR_AVAILABLE は rarfile ではなく 7z.exe の存在で判定するように変更
-
-# まず config から SEVENZ_EXE_PATH を試す
 resolved_sevenz_path = None
-if CFG_SEVENZ_EXE_PATH and shutil.which(CFG_SEVENZ_EXE_PATH): # 指定があり、かつ実行可能か
+if CFG_SEVENZ_EXE_PATH and shutil.which(CFG_SEVENZ_EXE_PATH):
     resolved_sevenz_path = CFG_SEVENZ_EXE_PATH
-else: # 指定がないか、指定されたパスが見つからない/実行不可の場合、PATHから探す
+else:
     resolved_sevenz_path = shutil.which("7z") or shutil.which("7z.exe")
 
 if resolved_sevenz_path:
     RAR_AVAILABLE = True
-    SEVENZ_PATH = resolved_sevenz_path # 実際に使用する7zのパス
+    SEVENZ_PATH = resolved_sevenz_path
 else:
     RAR_AVAILABLE = False
     SEVENZ_PATH = None
 
 try:
     import py7zr
-    SEVENZ_AVAILABLE = True # これはpy7zrライブラリに依存する7z形式の処理用なので残す
-                           # もし7z形式も7z.exeで統一するなら、このフラグもSEVENZ_PATHで判定する
+    SEVENZ_AVAILABLE = True
 except ImportError:
     SEVENZ_AVAILABLE = False
 
@@ -43,19 +41,9 @@ except ImportError:
 class BaseExtractor:
     """基础解压器类"""
     
-    def __init__(self, log_method=None, file_logger=None): # file_logger を追加
-        self.log_method = log_method # print のような関数を想定
-        self.file_logger = file_logger # ファイル出力用の標準ロガー
-        self.extracted_count = 0
-
-import asyncio # asyncio をトップレベルでインポート
-
-class BaseExtractor:
-    """基础解压器类"""
-
-    def __init__(self, log_method=None, file_logger=None): # file_logger を追加
-        self.log_method = log_method # print のような関数を想定
-        self.file_logger = file_logger # ファイル出力用の標準ロガー
+    def __init__(self, log_method=None, file_logger=None):
+        self.log_method = log_method
+        self.file_logger = file_logger
         self.extracted_count = 0
     
     def _log(self, message, level="INFO"):
@@ -152,35 +140,65 @@ class BaseExtractor:
         
         return processed_in_this_call # この呼び出しで実際に処理したファイル数を返す
 
-    async def extract_files_with_structure(self, members, extract_to, extract_func): # async def に変更
+    async def extract_files_with_structure(self, members, extract_to: Path, extract_func):
         """按原结构提取文件（处理乱码）"""
-        extracted_count = 0
-        
+        processed_in_this_call = 0
         for member in members:
+            member_name_for_log = "unknown_member_struct"
             try:
-                # 获取成员名称
-                member_name = self._get_member_name(member)
-                
-                # 处理路径中的乱码
-                path_parts = member_name.split('/')
-                # self.logger を self.file_logger に変更
-                safe_path_parts = [safe_filename(part, self.file_logger) for part in path_parts if part]
-                safe_path = '/'.join(safe_path_parts)
-                
-                if not safe_path:
+                member_name_raw = self._get_member_name(member) # Can be str or bytes
+                member_name_for_log = repr(member_name_raw)
+
+                # Ensure member_name is str before split, using safe_filename for robust conversion
+                # safe_filename handles bytes or str input and returns a sanitized str
+                safe_full_member_name = safe_filename(member_name_raw, self.file_logger)
+
+                if not safe_full_member_name:
+                    if self.log_method: self.log_method(f"  Filename became empty after safe_filename for member: {member_name_raw!r}. Skipping struct extract.", "WARNING")
                     continue
                 
-                final_path = extract_to / safe_path
+                # Now split the sanitized full name. os.path.normpath might be good too.
+                # Path parts should not be re-sanitized individually unless specific reasons.
+                parts = str(safe_full_member_name).split('/')
                 
-                # 提取文件
-                extract_func(member, final_path)
-                extracted_count += 1
+                # Filter out empty parts that might result from multiple slashes or leading/trailing slashes
+                # after safe_filename (though safe_filename should handle most of this)
+                cleaned_parts = [part for part in parts if part and part != '.'] # also remove '.' parts
+
+                if not cleaned_parts:
+                    if self.log_method: self.log_method(f"  Path for member {member_name_raw!r} resulted in no valid parts after cleaning. Skipping.", "WARNING")
+                    continue
+
+                # Create the final path by joining parts.
+                # os.path.join is robust for creating paths.
+                # extract_to is the base, and cleaned_parts form the relative path.
+                current_relative_path = Path(*cleaned_parts) # Use Path to join parts correctly for the OS
+                final_path = extract_to / current_relative_path
+
+                # The extract_func is responsible for creating parent dirs if needed for the final_path
+                # ensure_directory_exists(final_path.parent) # This should be handled by extract_func or just before it
                 
+                extract_func(member, final_path) # extract_func is still synchronous
+                self.extracted_count += 1
+                processed_in_this_call += 1
+                
+                # Optional: Log first few extractions
+                if processed_in_this_call <= 5: # Reduced from 10 for brevity if many files
+                    log_extract_msg = f"     ├─ Extracted (structure): {final_path.relative_to(extract_to)}"
+                    if self.log_method: self.log_method(log_extract_msg, "INFO")
+                elif processed_in_this_call == 6:
+                    log_extract_msg_more = f"     ├─ ... (more files extracted with structure in this archive)"
+                    if self.log_method: self.log_method(log_extract_msg_more, "INFO")
+
             except Exception as e:
-                self.log_warning(f"提取文件失败 {member_name}: {str(e)}")
+                err_msg_struct = f"Failed to extract member {member_name_for_log} with structure: {str(e)}"
+                if self.log_method: self.log_method(err_msg_struct, "WARNING")
+
+                if self.file_logger:
+                    self.file_logger.debug(f"Exception details for member {member_name_for_log} in extract_files_with_structure:", exc_info=True)
                 continue
         
-        return extracted_count
+        return processed_in_this_call # Return count of items processed in *this call*
     
     def _get_member_name(self, member):
         """获取成员名称（不同格式有不同的属性名）"""
@@ -542,7 +560,7 @@ class SevenZipExtractor(BaseExtractor):
                             if info.filename in file_data_map_sync:
                                 content_bytes = file_data_map_sync[info.filename].read()
                                 await asyncio.to_thread(ensure_directory_exists, current_target_path.parent)
-                                
+
                                 # open と write をまとめて to_thread で実行
                                 def sync_write(p_path_str, p_content):
                                     with open(p_path_str, 'wb') as f:
