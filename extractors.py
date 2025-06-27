@@ -146,15 +146,34 @@ class BaseExtractor:
             member_name_raw = str(member) # フォールバック
 
         # log_method があればそれを使用 (APIレスポンスとファイルログの両方に出る)
-        log_message = f"BaseExtractor._get_member_name: Raw member name from library: {member_name_raw!r} (type: {type(member_name_raw)})"
+        log_message_initial = f"BaseExtractor._get_member_name: Initial raw member name from library for member {member!r}: {member_name_raw!r} (type: {type(member_name_raw)})"
         if self.log_method:
-            self.log_method(log_message, "DEBUG")
-        # file_logger があればそちらにも (safe_filename に渡すロガーなので関連ログとして)
-        # log_method が file_logger にも出力するなら重複するが、明示的に両方試みる
-        elif self.file_logger: # log_method がない場合のみ、または常に追加で
-             self.file_logger.debug(log_message)
-        # else: # どちらもなければ print なども可能だが、通常はどちらかはあるはず
-            # print(f"[DEBUG] {log_message}")
+            self.log_method(log_message_initial, "DEBUG")
+        elif self.file_logger:
+             self.file_logger.debug(log_message_initial)
+
+        # ZIPファイルでUTF-8フラグが立っていない場合、エンコーディング問題の可能性がある
+        # member_name_raw が str 型で、かつそれが誤デコードされた結果かもしれない
+        if isinstance(member_name_raw, str) and hasattr(member, 'flag_bits') and not (member.flag_bits & 0x800):
+            # member.filename (str) を latin-1 でバイト列に戻し、再デコードを試みる
+            # これは、元のバイト列が latin-1 (あるいは他の1バイトエンコーディング) で誤って解釈されたと仮定
+            try:
+                filename_bytes_candidate = member_name_raw.encode('latin-1')
+                log_message_reencode = f"BaseExtractor._get_member_name: ZIP member, non-UTF8 flag. Re-encoded to bytes via latin-1: {filename_bytes_candidate!r}"
+                if self.log_method:
+                    self.log_method(log_message_reencode, "DEBUG")
+                elif self.file_logger:
+                    self.file_logger.debug(log_message_reencode)
+                # safe_filename にはこのバイト列候補を渡す
+                return filename_bytes_candidate
+            except Exception as e_reencode:
+                log_message_reencode_fail = f"BaseExtractor._get_member_name: Failed to re-encode suspected mis-decoded str via latin-1: {e_reencode}. Proceeding with original str."
+                if self.log_method:
+                    self.log_method(log_message_reencode_fail, "WARNING")
+                elif self.file_logger:
+                    self.file_logger.warning(log_message_reencode_fail)
+                # 失敗した場合は元の (おそらく文字化けした) 文字列をそのまま返す
+                return member_name_raw
 
         return member_name_raw
     
