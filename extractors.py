@@ -371,7 +371,7 @@ class ZipExtractor(BaseExtractor):
 class RarExtractor(BaseExtractor):
     """RAR文件解压器 (7z.exe を使用)"""
     
-    def extract(self, archive_path, extract_to: Path, extract_flat=False): # async を削除し、同期メソッドに戻す
+    async def extract(self, archive_path, extract_to: Path, extract_flat=False): # async を削除し、同期メソッドに戻す
         """使用7z.exe解压RAR文件"""
         # このメソッドは subprocess.run を使うので、元々ブロッキング。
         # 呼び出し側 (api.py) で asyncio.to_thread を使って非同期化するのが正しい。
