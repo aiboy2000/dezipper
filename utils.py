@@ -9,6 +9,7 @@ import time
 import unicodedata
 import re
 from pathlib import Path
+import chardet # chardet をインポート
 from config import ENCODING_ORDER, ILLEGAL_CHARS_PATTERN, COMPOUND_EXTENSIONS
 
 
@@ -36,21 +37,40 @@ def safe_filename(filename, logger=None):
         str: 安全的文件名
     """
     try:
-        # 尝试正确解码文件名
+        decoded_filename = None
         if isinstance(filename, bytes):
-            # 尝试多种编码方式
-            for encoding in ENCODING_ORDER:
+            # 1. chardet でエンコーディングを試す
+            detected = chardet.detect(filename)
+            if detected and detected['encoding'] and detected['confidence'] > 0.7: # 信頼度の閾値は調整可能
                 try:
-                    filename = filename.decode(encoding)
-                    break
-                except (UnicodeDecodeError, UnicodeError):
-                    continue
-            else:
-                # 如果所有编码都失败，使用错误处理
-                filename = filename.decode('utf-8', errors='replace')
+                    decoded_filename = filename.decode(detected['encoding'])
+                    if logger:
+                        logger.debug(f"Filename decoded as {detected['encoding']} by chardet with confidence {detected['confidence']:.2f}.")
+                except (UnicodeDecodeError, UnicodeError, LookupError): # LookupErrorは未知のエンコーディング名の場合
+                    if logger:
+                        logger.debug(f"Chardet detected {detected['encoding']} but decoding failed.")
+                    decoded_filename = None # デコード失敗
+
+            # 2. chardetでデコードできなかった場合、既存のENCODING_ORDERで試す
+            if decoded_filename is None:
+                for encoding in ENCODING_ORDER:
+                    try:
+                        decoded_filename = filename.decode(encoding)
+                        if logger:
+                            logger.debug(f"Filename decoded as {encoding} from ENCODING_ORDER.")
+                        break
+                    except (UnicodeDecodeError, UnicodeError):
+                        continue
+                else:
+                    # 全て失敗した場合
+                    if logger:
+                        logger.warning(f"All decoding attempts failed for filename bytes. Using utf-8 with replace.")
+                    decoded_filename = filename.decode('utf-8', errors='replace')
+            filename = decoded_filename
         
+        # filename が str 型であることを期待 (上記処理で str になっているはず)
         # 规范化Unicode字符
-        filename = unicodedata.normalize('NFC', filename)
+        filename = unicodedata.normalize('NFC', str(filename)) # str()でラップして型を保証
         
         # 移除或替换非法字符
         filename = re.sub(ILLEGAL_CHARS_PATTERN, '_', filename)
