@@ -9,6 +9,7 @@ import time
 import unicodedata
 import re
 from pathlib import Path
+import asyncio # asyncio をインポート
 import chardet # chardet をインポート
 from config import ENCODING_ORDER, ILLEGAL_CHARS_PATTERN, COMPOUND_EXTENSIONS
 
@@ -325,3 +326,21 @@ def get_unique_backup_name(original_path, timestamp_format='%Y%m%d_%H%M%S'):
         counter += 1
     
     return backup_path
+
+async def get_file_size(path_obj: Path) -> int:
+    """
+    指定されたPathオブジェクトのファイルサイズを取得します。
+    ファイルが存在しない場合は -1 を返します。
+    """
+    try:
+        if await asyncio.to_thread(path_obj.is_file):
+            stat_result = await asyncio.to_thread(path_obj.stat)
+            return stat_result.st_size
+        else:
+            return -1  # ファイルではないか、存在しない
+    except FileNotFoundError:
+        return -1
+    except Exception: # その他の予期せぬエラー
+        # logger があればログを出すべきだが、この関数はロガーを引数に取らない想定
+        # print(f"Error getting size for {path_obj}: {e}")
+        return -1 # エラー時は -1
