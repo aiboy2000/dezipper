@@ -368,11 +368,13 @@ class ZipExtractor(BaseExtractor):
         except Exception as e:
             raise Exception(f"ZIP解压失败: {str(e)}")
 
-class RarExtractor(BaseExtractor): # RarExtractor was already updated to use 7z.exe
+class RarExtractor(BaseExtractor):
     """RAR文件解压器 (7z.exe を使用)"""
     
-    async def extract(self, archive_path, extract_to: Path, extract_flat=False): # Made async
+    def extract(self, archive_path, extract_to: Path, extract_flat=False): # async を削除し、同期メソッドに戻す
         """使用7z.exe解压RAR文件"""
+        # このメソッドは subprocess.run を使うので、元々ブロッキング。
+        # 呼び出し側 (api.py) で asyncio.to_thread を使って非同期化するのが正しい。
         if not RAR_AVAILABLE or not SEVENZ_PATH:
             raise Exception("7-Zip (7z.exe) not found. Please install 7-Zip and ensure it's in your PATH.")
 
