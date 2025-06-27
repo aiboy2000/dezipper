@@ -36,55 +36,93 @@ def safe_filename(filename, logger=None):
     Returns:
         str: 安全的文件名
     """
+    if logger:
+        logger.debug(f"safe_filename: Received raw filename: {filename!r} (type: {type(filename)})")
+
     try:
-        decoded_filename = None
+        filename_str = None # デコード後の文字列を格納する変数
         if isinstance(filename, bytes):
             # 1. chardet でエンコーディングを試す
-            detected = chardet.detect(filename)
-            if detected and detected['encoding'] and detected['confidence'] > 0.7: # 信頼度の閾値は調整可能
-                try:
-                    decoded_filename = filename.decode(detected['encoding'])
-                    if logger:
-                        logger.debug(f"Filename decoded as {detected['encoding']} by chardet with confidence {detected['confidence']:.2f}.")
-                except (UnicodeDecodeError, UnicodeError, LookupError): # LookupErrorは未知のエンコーディング名の場合
-                    if logger:
-                        logger.debug(f"Chardet detected {detected['encoding']} but decoding failed.")
-                    decoded_filename = None # デコード失敗
+            if logger:
+                logger.debug(f"safe_filename: Input is bytes. Attempting chardet on: {filename!r}")
+            detected_info = chardet.detect(filename)
+            if logger:
+                logger.debug(f"safe_filename: chardet.detect result: {detected_info}")
 
-            # 2. chardetでデコードできなかった場合、既存のENCODING_ORDERで試す
-            if decoded_filename is None:
-                for encoding in ENCODING_ORDER:
-                    try:
-                        decoded_filename = filename.decode(encoding)
-                        if logger:
-                            logger.debug(f"Filename decoded as {encoding} from ENCODING_ORDER.")
-                        break
-                    except (UnicodeDecodeError, UnicodeError):
-                        continue
-                else:
-                    # 全て失敗した場合
+            if detected_info and detected_info['encoding'] and detected_info['confidence'] > 0.7:
+                try:
+                    filename_str = filename.decode(detected_info['encoding'])
                     if logger:
-                        logger.warning(f"All decoding attempts failed for filename bytes. Using utf-8 with replace.")
-                    decoded_filename = filename.decode('utf-8', errors='replace')
-            filename = decoded_filename
+                        logger.debug(f"safe_filename: Decoded as '{detected_info['encoding']}' by chardet (conf: {detected_info['confidence']:.2f}). Result: {filename_str!r}")
+                except (UnicodeDecodeError, UnicodeError, LookupError) as e:
+                    if logger:
+                        logger.debug(f"safe_filename: Chardet detected '{detected_info['encoding']}' but decoding failed: {e}")
+                    filename_str = None # デコード失敗、次のステップへ
+
+            # 2. chardetでデコードできなかった場合、または信頼度が低い場合、ENCODING_ORDERで試す
+            if filename_str is None:
+                if logger:
+                    logger.debug(f"safe_filename: chardet decoding failed or low confidence. Trying ENCODING_ORDER: {ENCODING_ORDER}")
+                for enc in ENCODING_ORDER:
+                    try:
+                        filename_str = filename.decode(enc)
+                        if logger:
+                            logger.debug(f"safe_filename: Successfully decoded as '{enc}' from ENCODING_ORDER. Result: {filename_str!r}")
+                        break # 成功したらループを抜ける
+                    except (UnicodeDecodeError, UnicodeError):
+                        if logger:
+                            logger.debug(f"safe_filename: Failed to decode as '{enc}'.")
+                        continue # 次のエンコーディングを試す
+                else: # forループがbreakしなかった場合 (全てのENCODING_ORDERで失敗)
+                    if logger:
+                        logger.warning(f"safe_filename: All ENCODING_ORDER attempts failed for byte string. Falling back to utf-8 with 'replace'. Original bytes: {filename!r}")
+                    filename_str = filename.decode('utf-8', errors='replace')
         
-        # filename が str 型であることを期待 (上記処理で str になっているはず)
-        # 规范化Unicode字符
-        filename = unicodedata.normalize('NFC', str(filename)) # str()でラップして型を保証
+        elif isinstance(filename, str):
+            if logger:
+                logger.debug(f"safe_filename: Input is already str: {filename!r}")
+            filename_str = filename
+        
+        else: # bytesでもstrでもない場合 (通常ありえないが念のため)
+            if logger:
+                logger.error(f"safe_filename: Received unexpected type: {type(filename)}. Value: {filename!r}. Converting to string representation.")
+            try:
+                filename_str = str(filename) # 強引に文字列化
+            except Exception as e_conv:
+                if logger:
+                    logger.error(f"safe_filename: Failed to convert type {type(filename)} to string: {e_conv}. Using fallback name.")
+                filename_str = f"unprocessable_type_{int(time.time())}"
+
+
+        # 规范化Unicode字符 (filename_str はこの時点で必ず str)
+        normalized_filename = unicodedata.normalize('NFC', filename_str)
+        if logger and normalized_filename != filename_str: # 変更があった場合のみログ出力
+            logger.debug(f"safe_filename: Normalized from {filename_str!r} to {normalized_filename!r}")
         
         # 移除或替换非法字符
-        filename = re.sub(ILLEGAL_CHARS_PATTERN, '_', filename)
-        filename = filename.strip('. ')
-        
-        # 处理空文件名
-        if not filename:
-            filename = f"unnamed_file_{int(time.time())}"
+        safe_filename_str = re.sub(ILLEGAL_CHARS_PATTERN, '_', normalized_filename)
+        if logger and safe_filename_str != normalized_filename: # 変更があった場合のみログ出力
+            logger.debug(f"safe_filename: Replaced illegal chars from {normalized_filename!r} to {safe_filename_str!r}")
             
-        return filename
+        # Strip leading/trailing dots and spaces
+        final_filename = safe_filename_str.strip('. ')
+        if logger and final_filename != safe_filename_str: # 変更があった場合のみログ出力
+            logger.debug(f"safe_filename: Stripped dots/spaces from {safe_filename_str!r} to {final_filename!r}")
+
+        # 处理空文件名
+        if not final_filename:
+            final_filename = f"unnamed_file_{int(time.time())}"
+            if logger:
+                logger.warning(f"safe_filename: Filename became empty after sanitization. Using fallback: {final_filename}")
+
+        if logger:
+            logger.debug(f"safe_filename: Returning final safe filename: {final_filename!r}")
+        return final_filename
         
     except Exception as e:
+        # このトップレベルのtry-exceptは、予期せぬ重大なエラーを捕捉するためのもの
         if logger:
-            logger.warning(f"文件名处理失败: {str(e)}")
+            logger.error(f"safe_filename: Unexpected critical error during safe_filename processing for input {filename!r}: {e}", exc_info=True)
         return f"unnamed_file_{int(time.time())}"
 
 

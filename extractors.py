@@ -137,12 +137,26 @@ class BaseExtractor:
     
     def _get_member_name(self, member):
         """获取成员名称（不同格式有不同的属性名）"""
+        member_name_raw = None
         if hasattr(member, 'filename'):  # ZIP
-            return member.filename
+            member_name_raw = member.filename
         elif hasattr(member, 'name'):  # TAR/RAR/7Z
-            return member.name
+            member_name_raw = member.name
         else:
-            return str(member)
+            member_name_raw = str(member) # フォールバック
+
+        # log_method があればそれを使用 (APIレスポンスとファイルログの両方に出る)
+        log_message = f"BaseExtractor._get_member_name: Raw member name from library: {member_name_raw!r} (type: {type(member_name_raw)})"
+        if self.log_method:
+            self.log_method(log_message, "DEBUG")
+        # file_logger があればそちらにも (safe_filename に渡すロガーなので関連ログとして)
+        # log_method が file_logger にも出力するなら重複するが、明示的に両方試みる
+        elif self.file_logger: # log_method がない場合のみ、または常に追加で
+             self.file_logger.debug(log_message)
+        # else: # どちらもなければ print なども可能だが、通常はどちらかはあるはず
+            # print(f"[DEBUG] {log_message}")
+
+        return member_name_raw
     
     def _is_directory(self, member):
         """判断成员是否为目录"""
