@@ -10,6 +10,7 @@ import zipfile
 import tarfile
 from pathlib import Path
 import asyncio # asyncio をここにインポート
+import time # time をインポート
 import subprocess # subprocess をインポート
 import sys # sys をインポート
 
@@ -118,7 +119,7 @@ class BaseExtractor:
                         if self.log_method: self.log_method(msg, "INFO")
                         current_target_path = renamed_target_path
                 
-                extract_func(member, current_target_path)
+                await asyncio.to_thread(extract_func, member, current_target_path)
                 self.extracted_count += 1
                 processed_in_this_call +=1
                 
@@ -178,7 +179,7 @@ class BaseExtractor:
                 # The extract_func is responsible for creating parent dirs if needed for the final_path
                 # ensure_directory_exists(final_path.parent) # This should be handled by extract_func or just before it
                 
-                extract_func(member, final_path) # extract_func is still synchronous
+                await asyncio.to_thread(extract_func, member, final_path) # extract_func is still synchronous
                 self.extracted_count += 1
                 processed_in_this_call += 1
                 
@@ -290,41 +291,52 @@ class BaseExtractor:
             # member オブジェクトの型が異なるため、この判定は必ずしも正しくない可能性がある。
             # 各Extractorで必要ならオーバーライドするか、より堅牢な判定が必要。
             # ただし、extract_files_flatでは主にファイルのみを処理するため、影響は限定的。
-            return self._get_member_name(member).endswith('/')
+            name_to_check = self._get_member_name(member) # _get_member_name can return bytes
+            if isinstance(name_to_check, bytes):
+                try:
+                    name_to_check = name_to_check.decode('utf-8', 'surrogateescape')
+                except Exception: # Fallback if any error during decode
+                    name_to_check = "" # Avoid error in endswith if decode fails badly
+            return name_to_check.endswith('/')
 
 
 class ZipExtractor(BaseExtractor):
     """ZIP文件解压器"""
     
-    def extract(self, archive_path, extract_to, extract_flat=False):
+    async def extract(self, archive_path, extract_to: Path, extract_flat=False):
         """解压ZIP文件"""
         try:
+            # zipfile.ZipFile is sync, consider to_thread if it blocks for too long on open
             with zipfile.ZipFile(archive_path, 'r') as zip_ref:
                 # 检查是否有密码保护
                 try:
-                    zip_ref.testzip()
+                    # testzip can be I/O bound
+                    await asyncio.to_thread(zip_ref.testzip)
                 except RuntimeError as e:
                     if "Bad password" in str(e) or "password required" in str(e):
                         raise Exception("文件有密码保护，无法解压")
                     raise e
                 
-                members = zip_ref.infolist()
+                members = zip_ref.infolist() # This is sync
                 
                 if extract_flat:
                     # 扁平化提取
-                    def extract_single_zip(member, target_path: Path): # target_path の型ヒント追加
-                        ensure_directory_exists(target_path.parent)
-
-                        path_to_open_str = str(target_path)
+                    def extract_single_zip(member, target_path_cb: Path): # Renamed to avoid confusion
+                        ensure_directory_exists(target_path_cb.parent)
+                        path_to_open_str = str(target_path_cb)
                         if os.name == 'nt':
                             # resolve() は既に ensure_directory_exists で呼ばれているかもしれないが、念のため
                             # ただし、ファイルパスなので resolve() ではなく abspath() が適切か。
                             # final_path は既に avoid_filename_conflict を通って絶対パスになっている想定。
-                            abs_path_str = str(target_path.resolve()) if target_path.is_absolute() else str(Path(os.path.abspath(str(target_path))).resolve())
+                            abs_path_str = str(target_path_cb.resolve()) if target_path_cb.is_absolute() else str(Path(os.path.abspath(str(target_path_cb))).resolve())
 
                             if len(abs_path_str) >= 240 and not abs_path_str.startswith('\\\\?\\'):
                                 path_to_open_str = '\\\\?\\' + abs_path_str
 
+                        # zip_ref.open and shutil.copyfileobj are sync
+                        # This whole callback runs in the main thread if extract_files_flat isn't careful,
+                        # or in a thread if extract_func itself is wrapped in to_thread by the caller.
+                        # For simplicity, assuming extract_func is called in a way that allows blocking IO for now.
                         with zip_ref.open(member) as source, open(path_to_open_str, 'wb') as target:
                             shutil.copyfileobj(source, target)
                     
@@ -336,12 +348,12 @@ class ZipExtractor(BaseExtractor):
                     return await self.extract_files_flat(members, extract_to, extract_single_zip)
                 else:
                     # 保持结构提取
-                    def extract_single_zip(member, target_path: Path): # target_path の型ヒント追加
-                        ensure_directory_exists(target_path.parent) # これは同期のままで良い
-                        if not member.is_dir():
-                            path_to_open_str = str(target_path)
+                    def extract_single_zip(member, target_path_cb: Path):
+                        ensure_directory_exists(target_path_cb.parent) # これは同期のままで良い
+                        if not member.is_dir(): # member.is_dir() is sync
+                            path_to_open_str = str(target_path_cb)
                             if os.name == 'nt':
-                                abs_path_str = str(target_path.resolve()) if target_path.is_absolute() else str(Path(os.path.abspath(str(target_path))).resolve())
+                                abs_path_str = str(target_path_cb.resolve()) if target_path_cb.is_absolute() else str(Path(os.path.abspath(str(target_path_cb))).resolve())
                                 if len(abs_path_str) >= 240 and not abs_path_str.startswith('\\\\?\\'):
                                     path_to_open_str = '\\\\?\\' + abs_path_str
 
@@ -356,65 +368,39 @@ class ZipExtractor(BaseExtractor):
         except Exception as e:
             raise Exception(f"ZIP解压失败: {str(e)}")
 
-
-import subprocess # subprocess をインポート
-import sys # sys をインポート
-
-class RarExtractor(BaseExtractor):
+class RarExtractor(BaseExtractor): # RarExtractor was already updated to use 7z.exe
     """RAR文件解压器 (7z.exe を使用)"""
     
-    def extract(self, archive_path, extract_to, extract_flat=False): # extract_flat は7z.exeでは直接制御しにくい
+    async def extract(self, archive_path, extract_to: Path, extract_flat=False): # Made async
         """使用7z.exe解压RAR文件"""
         if not RAR_AVAILABLE or not SEVENZ_PATH:
-            # このメッセージは実質的に「7z.exeが見つかりません」となる
             raise Exception("7-Zip (7z.exe) not found. Please install 7-Zip and ensure it's in your PATH.")
 
         archive_path_str = str(archive_path)
         extract_to_str = str(extract_to)
 
-        # 7z.exe のコマンドを構築
-        # x: eXtract with full paths (フルパスで展開)
-        # -y: Assume Yes on all queries (すべて上書き)
-        # -o: Set Output directory (出力先指定。-o とパスの間にスペースなし)
-        cmd = [SEVENZ_PATH, 'x', archive_path_str, f'-o{extract_to_str}', '-y']
-
-        # extract_flat の考慮:
-        # 7z.exe の 'e' コマンドはフラット展開だが、サブディレクトリ内の同名ファイルは上書きされる可能性がある。
-        # 安全のため、'x' で構造通り展開後、必要ならPython側でファイルを移動する方が確実だが、複雑になる。
-        # ここでは extract_flat が True の場合、'e' コマンドを使用する試みを行う。
-        # ただし、7z.exe 'e' の挙動（特にサブディレクトリの扱い）は注意が必要。
-        # BaseExtractorのextract_files_flatのような柔軟な処理は難しい。
-        # 今回は extract_flat は無視し、常に構造を保持して展開するか、
-        # または 'e' コマンドで試みるが、限定的なサポートとなることを許容する。
         if extract_flat:
-            # フラット展開の場合、'e' コマンドを使用し、出力先は extract_to をそのまま使用
-            # (extract_to は BatchExtractor側でフラットなパスが指定される想定)
             cmd = [SEVENZ_PATH, 'e', archive_path_str, f'-o{extract_to_str}', '-y']
             self.log_method(f"RAR flat extraction with 7z.exe: Files will be extracted to {extract_to_str}. Existing same-name files will be overwritten.", "INFO")
         else:
-            # 構造を保持する場合 (既存のロジック)
             cmd = [SEVENZ_PATH, 'x', archive_path_str, f'-o{extract_to_str}', '-y']
 
         self.log_method(f"Attempting to extract RAR (using 7z.exe): {archive_path_str} to {extract_to_str} (flat={extract_flat})", "INFO")
         self.log_method(f"Executing command: {' '.join(cmd)}", "DEBUG")
 
         try:
-            process = subprocess.run(cmd, capture_output=True, text=True, check=False, encoding='utf-8', errors='replace')
+            # subprocess.run is sync, run in thread
+            process = await asyncio.to_thread(
+                subprocess.run, cmd, capture_output=True, text=True, check=False,
+                encoding='utf-8', errors='replace'
+            )
 
             if process.stdout:
                 self.log_method(f"7z stdout:\n{process.stdout}", "DEBUG")
             if process.stderr:
-                # 7zはエラーでなくてもstderrに情報を出すことがある (例: "Everything is Ok")
-                # そのため、終了コードも併せて判断する
                 self.log_method(f"7z stderr:\n{process.stderr}", "DEBUG" if process.returncode == 0 else "ERROR")
 
             if process.returncode != 0:
-                # エラーコードの詳細は7zのドキュメント参照
-                # 1: Warning (non-critical error)
-                # 2: Fatal error
-                # 7: Command line error
-                # 8: Not enough memory
-                # 255: User stopped the process
                 error_message = f"7z.exe failed with return code {process.returncode}."
                 if "password" in process.stderr.lower() or "cannot open encrypted archive" in process.stderr.lower() :
                      error_message = "RAR file seems to be password protected. 7z.exe cannot extract it without a password."
@@ -424,200 +410,111 @@ class RarExtractor(BaseExtractor):
                 raise Exception(error_message)
 
             self.log_method(f"RAR file extracted successfully (using 7z.exe): {archive_path_str}", "SUCCESS")
-            # extracted_count はアーカイブ単位で1とする。
-            # 正確なファイル数を取るには `7z l -ba <archive>` を事前実行しパースする必要がある。
             return 1
 
         except FileNotFoundError:
             self.log_method(f"7z.exe not found at {SEVENZ_PATH}. Please ensure 7-Zip is installed and in your PATH.", "ERROR")
             raise Exception(f"7z.exe not found at {SEVENZ_PATH}.")
-        except subprocess.CalledProcessError as e: # check=True の場合だが、今回はFalseなのでここには来ないはず
-            self.log_method(f"7z.exe execution failed: {e.stderr}", "ERROR")
-            raise Exception(f"RAR extraction failed using 7z.exe: {e.stderr}")
         except Exception as e:
             self.log_method(f"An unexpected error occurred during RAR extraction with 7z.exe: {str(e)}", "ERROR")
-            # raise e # 元の例外をそのまま投げるか、カスタム例外を投げる
             raise Exception(f"RAR extraction failed: {str(e)}")
 
 
 class SevenZipExtractor(BaseExtractor):
     """7Z文件解压器"""
     
-    async def extract(self, archive_path, extract_to: Path, extract_flat=False): # async def に変更, extract_to の型ヒント追加
+    async def extract(self, archive_path, extract_to: Path, extract_flat=False):
         """解压7Z文件"""
-        from utils import get_file_size # ローカルインポート
-        if not SEVENZ_AVAILABLE:
-            raise Exception("7Z支持未安装，请使用: pip install py7zr")
+        if not SEVENZ_AVAILABLE: # This refers to py7zr library
+            # TODO: Consider falling back to 7z.exe if py7zr is not available but SEVENZ_PATH is set.
+            # For now, stick to py7zr if SEVENZ_AVAILABLE is True.
+            raise Exception("py7zr library not installed. Please use: pip install py7zr")
             
         try:
-            # py7zr.SevenZipFile は同期的なので、必要なら to_thread でラップするが、
-            # open処理自体はそれほど重くないと仮定。重いのは extract や list。
-            with py7zr.SevenZipFile(archive_path, mode='r') as z:
-                if await asyncio.to_thread(z.needs_password): # needs_password も同期の可能性
-                    raise Exception("7Z文件有密码保护，无法解压")
-                
-                if extract_flat:
-                    processed_in_this_call = 0
-                    # z.list() も同期的なので注意。大量ファイルでブロックする可能性。
-                    # 理想的にはライブラリが非同期サポートするか、反復処理を to_thread で行う。
-                    # ここでは簡略化のため同期的にリスト取得。
-                    member_infos = await asyncio.to_thread(z.list)
+            # py7zr operations are mostly synchronous.
+            async def do_extract_flat_py7zr():
+                processed_count = 0
+                # Opening the archive
+                with py7zr.SevenZipFile(archive_path, mode='r') as z_sync:
+                    if z_sync.needs_password():
+                        raise Exception("7Z文件有密码保护，无法解压 (py7zr)")
+                    member_infos_sync = z_sync.list()
 
-                    for info in member_infos:
-                        if not info.is_dir:
-                            filename_part_raw = os.path.basename(info.filename)
-                            if not filename_part_raw:
-                                if self.log_method: self.log_method(f"  7Z: Could not determine filename from member: {info.filename!r}. Skipping.", "WARNING")
+                # Process members
+                for info in member_infos_sync:
+                    if not info.is_dir:
+                        filename_part_raw = os.path.basename(info.filename)
+                        if not filename_part_raw:
+                            if self.log_method: self.log_method(f"  7Z: Could not determine filename from member: {info.filename!r}. Skipping.", "WARNING")
+                            continue
+
+                        safe_filename_part = safe_filename(filename_part_raw, self.file_logger)
+                        if not safe_filename_part:
+                            safe_filename_part = f"unnamed_7z_file_{int(time.time())}"
+                            if self.log_method: self.log_method(f"  7Z: Filename became empty, using fallback: {safe_filename_part}", "WARNING")
+
+                        current_target_path = extract_to / safe_filename_part
+
+                        if await asyncio.to_thread(current_target_path.exists) and \
+                           await asyncio.to_thread(current_target_path.is_file):
+                            member_size = info.uncompressed if hasattr(info, 'uncompressed') else getattr(info, 'size', -1)
+                            existing_file_size = await get_file_size(current_target_path)
+
+                            if member_size != -1 and existing_file_size != -1 and member_size == existing_file_size:
+                                if self.log_method: self.log_method(f"  7Z: Skipping (same name/size): {safe_filename_part}", "INFO")
                                 continue
-
-                            safe_filename_part = safe_filename(filename_part_raw, self.file_logger)
-                            if not safe_filename_part:
-                                safe_filename_part = f"unnamed_7z_file_{int(time.time())}"
-                                if self.log_method: self.log_method(f"  7Z: Filename became empty after sanitization, using fallback: {safe_filename_part}", "WARNING")
-
-                            current_target_path = extract_to / safe_filename_part
-
-                            if await asyncio.to_thread(current_target_path.exists) and \
-                               await asyncio.to_thread(current_target_path.is_file):
-
-                                member_size = info.uncompressed if hasattr(info, 'uncompressed') else getattr(info, 'size', -1)
-                                existing_file_size = await get_file_size(current_target_path)
-
-                                log_msg_conflict = (
-                                    f"  7Z: File '{safe_filename_part}' already exists. "
-                                    f"Member size: {member_size}, Existing size: {existing_file_size}."
-                                )
-                                if self.log_method: self.log_method(log_msg_conflict, "DEBUG")
-
-                                if member_size != -1 and existing_file_size != -1 and member_size == existing_file_size:
-                                    msg = f"  7Z: Skipping (same name and size): {safe_filename_part} (Size: {member_size} bytes)"
-                                    if self.log_method: self.log_method(msg, "INFO")
-                                    continue
-                                else:
-                                    renamed_target_path = avoid_filename_conflict(current_target_path)
-                                    msg = (
-                                        f"  7Z: File '{safe_filename_part}' exists with different size or size unknown. "
-                                        f"Renaming to '{renamed_target_path.name}'."
-                                    )
-                                    if self.log_method: self.log_method(msg, "INFO")
-                                    current_target_path = renamed_target_path
-
-                            # 実際の展開処理
-                            # z.extract はターゲットファイル名を指定できないため、一度テンポラリな親ディレクトリに展開し、
-                            # その後正しい名前で移動する必要がある。
-                            # ここでは current_target_path.parent に info.filename という名前で展開されると仮定。
-                            # そして shutil.move で current_target_path (リネーム後かもしれない) に移動する。
-
-                            # py7zr の extract メソッドは path にディレクトリを指定する。
-                            # targets に展開したいファイル名をリストで渡す。
-                            # ここでは、extract_to (フラット展開先のルート) に直接展開させる。
-                            # しかし、ファイル名を指定して展開できないため、この方法は使えない。
-                            # やはり、一度安全な一時ディレクトリに全展開するか、
-                            # または、py7zrのextractの挙動をよく理解して、
-                            # 展開後のファイル名が予測できるならそれを使う。
-                            # info.filename はアーカイブ内のフルパス。
-                            # py7zrは、デフォルトではターゲットパス直下にそのフルパス構造を再現しようとする。
-                            # フラット展開のためには、ファイルごとに処理し、メモリ上で展開して書き出すのが理想。
-
-                            # py7zrのドキュメントによると、extractのtargetsで指定したファイルは、
-                            # 指定したpathの直下に展開されるのではなく、アーカイブ内のパス構造を一部維持する。
-                            # targets=['path/to/file.txt'], path='extract_dir' -> 'extract_dir/path/to/file.txt'
-                            # これではフラット展開にならない。
-
-                            # 従って、py7zrでフラット展開と同名ファイル処理を厳密に行うには、
-                            # メモリ上でファイル内容を取得し、current_target_pathに書き込む必要がある。
-                            # all_files = await asyncio.to_thread(z.read, targets=[info.filename])
-                            # if info.filename in all_files:
-                            #     content = all_files[info.filename].read() # BytesIO.read() -> bytes
-                            #     async with aiofiles.open(current_target_path, 'wb') as f: # aiofiles が必要
-                            #         await f.write(content)
-
-                            # aiofilesを使わない同期的な代替 (to_threadでラップ)
-                            def write_file_content(p_target_path, p_info_filename):
-                                ensure_directory_exists(p_target_path.parent) # Windows長いパス対応のため、自前のensureを使う
-                                file_data_map = z.read(targets=[p_info_filename]) # これは同期
-                                if p_info_filename in file_data_map:
-                                    with open(p_target_path, 'wb') as f_out: # openも長いパス対応が必要
-                                        f_out.write(file_data_map[p_info_filename].read())
-                                else:
-                                    raise FileNotFoundError(f"Content for {p_info_filename} not found in py7zr read result")
-
-                            # Windows長いパス対応のため、open前にパス文字列を加工
-                            path_to_open_str = str(current_target_path)
-                            if os.name == 'nt':
-                                abs_path_str = str(current_target_path.resolve()) if current_target_path.is_absolute() else str(Path(os.path.abspath(str(current_target_path))).resolve())
-                                if len(abs_path_str) >= 240 and not abs_path_str.startswith('\\\\?\\'):
-                                    path_to_open_str = '\\\\?\\' + abs_path_str
-
-                            # 実際の書き出し処理を to_thread で実行
-                            # write_file_content に渡す target_path は Path オブジェクトのままが良いか、
-                            # あるいは加工済みの path_to_open_str を渡すか。
-                            # write_file_content 内部で open する際に path_to_open_str を使うようにする。
-                            # そのためには、write_file_content の引数を調整するか、
-                            # open(path_to_open_str, 'wb') を直接 to_thread でラップする。
-
-                            file_data_map_sync = z.read(targets=[info.filename]) # 同期処理
-                            if info.filename in file_data_map_sync:
-                                content_bytes = file_data_map_sync[info.filename].read()
-                                await asyncio.to_thread(ensure_directory_exists, current_target_path.parent)
-
-                                # open と write をまとめて to_thread で実行
-                                def sync_write(p_path_str, p_content):
-                                    with open(p_path_str, 'wb') as f:
-                                        f.write(p_content)
-                                await asyncio.to_thread(sync_write, path_to_open_str, content_bytes)
-
-                                processed_in_this_call += 1
-                                self.extracted_count +=1 # BaseExtractor の総カウント
-
-                                if processed_in_this_call <= 10:
-                                    self.log_info(f"     ├─ Extracted (flat 7z): {current_target_path.name}")
-                                elif processed_in_this_call == 11:
-                                    self.log_info(f"     ├─ ... (more 7z files extracted flatly)")
                             else:
-                                self.log_warning(f"  7Z: Content for {info.filename} not found after z.read(). Skipping.")
+                                renamed_target_path = avoid_filename_conflict(current_target_path)
+                                if self.log_method: self.log_method(f"  7Z: Renaming '{safe_filename_part}' to '{renamed_target_path.name}'", "INFO")
+                                current_target_path = renamed_target_path
 
-                    return processed_in_this_call
-                else:
-                    # 保持结构提取 (py7zr の extractall は同期)
-                    # ensure_directory_exists(extract_to) # extractallがやってくれるはず
-                    await asyncio.to_thread(z.extractall, extract_to)
-                    # カウントはディレクトリ以外のメンバー数
-                    member_infos = await asyncio.to_thread(z.list)
-                    return len([info for info in member_infos if not info.is_dir])
+                        path_to_open_str = str(current_target_path)
+                        if os.name == 'nt':
+                            abs_path_str = str(current_target_path.resolve()) if current_target_path.is_absolute() else str(Path(os.path.abspath(str(current_target_path))).resolve())
+                            if len(abs_path_str) >= 240 and not abs_path_str.startswith('\\\\?\\'):
+                                path_to_open_str = '\\\\?\\' + abs_path_str
 
-        except py7zr.Bad7zFile:
-                                z.extract(targets=[info.filename], path=final_path.parent)
-                                
-                                # 移动到最终位置（如果需要重命名）
-                                extracted_file = final_path.parent / info.filename # これはPathオブジェクト
-                                if extracted_file != final_path:
-                                    src_path_str = str(extracted_file)
-                                    dst_path_str = str(final_path)
-                                    if os.name == 'nt':
-                                        # shutil.move の src と dst の両方にプレフィックスを試す
-                                        abs_src_path_str = str(extracted_file.resolve()) if extracted_file.is_absolute() else str(Path(os.path.abspath(str(extracted_file))).resolve())
-                                        abs_dst_path_str = str(final_path.resolve()) if final_path.is_absolute() else str(Path(os.path.abspath(str(final_path))).resolve())
+                        # Re-open for z.read to avoid issues with shared file handle across threads if any
+                        with py7zr.SevenZipFile(archive_path, mode='r') as z_read_sync:
+                             file_data_map_sync = z_read_sync.read(targets=[info.filename])
 
-                                        if len(abs_src_path_str) >= 240 and not abs_src_path_str.startswith('\\\\?\\'):
-                                            src_path_str = '\\\\?\\' + abs_src_path_str
-                                        if len(abs_dst_path_str) >= 240 and not abs_dst_path_str.startswith('\\\\?\\'):
-                                            dst_path_str = '\\\\?\\' + abs_dst_path_str
+                        if info.filename in file_data_map_sync:
+                            content_bytes = file_data_map_sync[info.filename].read()
+                            await asyncio.to_thread(ensure_directory_exists, current_target_path.parent)
 
-                                    shutil.move(src_path_str, dst_path_str)
-                                
-                                extracted_count += 1
-                                
-                                if extracted_count <= 10:
-                                    self.log_info(f"     ├─ {safe_name}")
-                                elif extracted_count == 11:
-                                    self.log_info(f"     ├─ ... (还有更多文件)")
-                    
-                    return extracted_count
-                else:
-                    # 保持结构提取
-                    z.extractall(extract_to)
-                    return len([info for info in z.list() if not info.is_dir])
+                            def sync_write_7z(p_path_str, p_content):
+                                with open(p_path_str, 'wb') as f:
+                                    f.write(p_content)
+                            await asyncio.to_thread(sync_write_7z, path_to_open_str, content_bytes)
+
+                            processed_count += 1
+                            self.extracted_count +=1
+
+                            if processed_count <= 10:
+                                self.log_info(f"     ├─ Extracted (flat 7z): {current_target_path.name}")
+                            elif processed_count == 11:
+                                self.log_info(f"     ├─ ... (more 7z files extracted flatly)")
+                        else:
+                            self.log_warning(f"  7Z: Content for {info.filename} not found after z.read(). Skipping.")
+                return processed_count
+
+            async def do_extract_all_py7zr():
+                # This inner function is still largely synchronous due to py7zr's nature
+                with py7zr.SevenZipFile(archive_path, mode='r') as z_sync:
+                    if z_sync.needs_password(): # This is a property access, likely quick
+                        raise Exception("7Z文件有密码保护，无法解压 (py7zr)")
+                    # extractall can be very I/O bound and block
+                    z_sync.extractall(path=extract_to)
+                    member_infos_sync = z_sync.list() # Also potentially blocking if archive is large
+                    return len([info for info in member_infos_sync if not info.is_dir])
+
+            if extract_flat:
+                return await do_extract_flat_py7zr()
+            else:
+                # Wrap the call to the synchronous part in to_thread
+                # The original do_extract_all_py7zr itself contains synchronous blocking calls.
+                # So, we run the entire helper in a thread.
+                return await asyncio.to_thread(do_extract_all_py7zr)
                 
         except py7zr.Bad7zFile:
             raise Exception("7Z文件已损坏或格式不正确")
@@ -628,42 +525,40 @@ class SevenZipExtractor(BaseExtractor):
 class TarExtractor(BaseExtractor):
     """TAR系列文件解压器"""
     
-    def extract(self, archive_path, extract_to, extract_flat=False):
+    async def extract(self, archive_path, extract_to: Path, extract_flat=False): # Made async
         """解压TAR系列文件"""
         try:
+            # tarfile.open is sync
             with tarfile.open(archive_path, 'r:*') as tar_ref:
-                members = tar_ref.getmembers()
+                members = tar_ref.getmembers() # sync
                 
                 if extract_flat:
-                    # 扁平化提取
-                    def extract_single_tar(member, target_path: Path): # target_path の型ヒント追加
-                        if member.isfile():
-                            ensure_directory_exists(target_path.parent)
-                            path_to_open_str = str(target_path)
+                    def extract_single_tar(member, target_path_cb: Path):
+                        if member.isfile(): # sync
+                            ensure_directory_exists(target_path_cb.parent) # sync
+                            path_to_open_str = str(target_path_cb)
                             if os.name == 'nt':
-                                abs_path_str = str(target_path.resolve()) if target_path.is_absolute() else str(Path(os.path.abspath(str(target_path))).resolve())
+                                abs_path_str = str(target_path_cb.resolve()) if target_path_cb.is_absolute() else str(Path(os.path.abspath(str(target_path_cb))).resolve())
                                 if len(abs_path_str) >= 240 and not abs_path_str.startswith('\\\\?\\'):
                                     path_to_open_str = '\\\\?\\' + abs_path_str
+                            # tar_ref.extractfile and shutil.copyfileobj are sync
                             with tar_ref.extractfile(member) as source, open(path_to_open_str, 'wb') as target:
                                 shutil.copyfileobj(source, target)
                     
-                    # extract_files_flat は async になったので await で呼び出す
                     return await self.extract_files_flat(members, extract_to, extract_single_tar)
                 else:
-                    # 保持结构提取（安全检查）
-                    def extract_single_tar(member, target_path: Path): # target_path の型ヒント追加
-                        if not (member.name.startswith('/') or '..' in member.name): # 安全チェック
+                    def extract_single_tar(member, target_path_cb: Path):
+                        if not (member.name.startswith('/') or '..' in member.name):
                             if member.isfile():
-                                ensure_directory_exists(target_path.parent) # 同期でOK
-                                path_to_open_str = str(target_path)
+                                ensure_directory_exists(target_path_cb.parent)
+                                path_to_open_str = str(target_path_cb)
                                 if os.name == 'nt':
-                                    abs_path_str = str(target_path.resolve()) if target_path.is_absolute() else str(Path(os.path.abspath(str(target_path))).resolve())
+                                    abs_path_str = str(target_path_cb.resolve()) if target_path_cb.is_absolute() else str(Path(os.path.abspath(str(target_path_cb))).resolve())
                                     if len(abs_path_str) >= 240 and not abs_path_str.startswith('\\\\?\\'):
                                         path_to_open_str = '\\\\?\\' + abs_path_str
                                 with tar_ref.extractfile(member) as source, open(path_to_open_str, 'wb') as target:
                                     shutil.copyfileobj(source, target)
                     
-                    # extract_files_with_structure も async になったので await で呼び出す
                     return await self.extract_files_with_structure(members, extract_to, extract_single_tar)
                 
         except tarfile.TarError:
@@ -673,7 +568,7 @@ class TarExtractor(BaseExtractor):
 
 
 # 解压器工厂函数
-def get_extractor(file_extension, log_method=None, file_logger=None): # file_logger を追加
+def get_extractor(file_extension, log_method=None, file_logger=None):
     """
     根据文件扩展名获取对应的解压器
     
@@ -700,7 +595,6 @@ def get_extractor(file_extension, log_method=None, file_logger=None): # file_log
     
     extractor_class = extractors.get(file_extension)
     if extractor_class:
-        # log_method と file_logger の両方を渡す
         return extractor_class(log_method=log_method, file_logger=file_logger)
     else:
         raise ValueError(f"不支持的文件格式: {file_extension}")
