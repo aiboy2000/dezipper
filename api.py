@@ -42,7 +42,7 @@ class BatchExtractor:
     def _setup_file_logger(self):
         """ファイル出力用のロガーをセットアップ"""
         logger = logging.getLogger(f"BatchExtractor_{self.request_id}")
-        logger.setLevel(logging.INFO)
+        logger.setLevel(logging.DEBUG) # INFO から DEBUG に変更
 
         # Avoid adding handlers multiple times if logger already configured
         if not logger.handlers:
