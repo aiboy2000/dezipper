@@ -327,6 +327,44 @@ def get_unique_backup_name(original_path, timestamp_format='%Y%m%d_%H%M%S'):
     
     return backup_path
 
+def avoid_filename_conflict_timestamp(target_path: Path) -> Path:
+    """
+    Avoids filename conflicts by appending a timestamp if the file already exists.
+    If target_path is a directory or does not exist, it's returned as is.
+    Args:
+        target_path: The target file path.
+    Returns:
+        Path: A unique file path, with a timestamp if a conflict was resolved.
+    """
+    if not target_path.exists() or target_path.is_dir():
+        return target_path
+
+    # Ensure it's a file path we're dealing with for conflict resolution
+    # This check is somewhat redundant due to `is_dir()` above, but good for clarity
+    if not target_path.is_file():
+        return target_path # Should not happen if exists() and not is_dir()
+
+    base = target_path.parent
+    name_part = target_path.stem
+    ext_part = target_path.suffix # includes the dot, e.g., '.txt'
+
+    while True:
+        # Format: YYYYMMDDHHMMSSFFF (FFF for milliseconds)
+        timestamp_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
+        # For milliseconds, time.time() gives seconds with fraction
+        milliseconds = f"{int((time.time() % 1) * 1000):03d}"
+        timestamp_str += milliseconds
+
+        new_name = f"{name_part}_{timestamp_str}{ext_part}"
+        new_path = base / new_name
+
+        if not new_path.exists():
+            return new_path
+        # In the highly unlikely event of a timestamp collision, loop and try again
+        # Adding a small delay can help, but usually not necessary
+        time.sleep(0.001) # Sleep for 1ms to ensure next timestamp is different
+
+
 async def get_file_size(path_obj: Path) -> int:
     """
     指定されたPathオブジェクトのファイルサイズを取得します。

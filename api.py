@@ -16,7 +16,8 @@ from config import (
 )
 from utils import (
     format_file_size, get_file_extension,
-    get_unique_backup_name, ensure_directory_exists
+    get_unique_backup_name, ensure_directory_exists,
+    avoid_filename_conflict_timestamp # Added import
 )
 from extractors import get_extractor, RAR_AVAILABLE, SEVENZ_AVAILABLE
 
@@ -202,8 +203,15 @@ class BatchExtractor:
 
         finally:
             self.stats['processed'] += 1
+            # Moved archive deletion logic after flattening
 
-            if extraction_success and self.delete_original:
+        if extraction_success:
+            # Call flatten operation here, using extract_to as the folder to flatten
+            # extract_to is the directory where files were initially extracted (e.g., work_dir/archive_stem)
+            await self._flatten_extraction_result_async(extract_to)
+
+            # Now handle original archive deletion after successful extraction and flattening
+            if self.delete_original:
                 try:
                     if await asyncio.to_thread(archive_path.exists):
                         await asyncio.to_thread(archive_path.unlink)
@@ -213,8 +221,7 @@ class BatchExtractor:
                         self._log(f"  Original file not found, cannot delete: {relative_path}", "WARNING")
                 except Exception as delete_error:
                     self._log(f"  Failed to delete original file: {str(delete_error)}", "ERROR")
-
-            elif extraction_success and not self.delete_original:
+            else: # not self.delete_original
                 self._log(f"  Kept original archive: {relative_path}", "INFO")
 
         return extraction_success
@@ -264,26 +271,84 @@ class BatchExtractor:
         self._log(f"Final Statistics:", "INFO")
         self._log(f"  Processing rounds: {round_count}", "INFO")
         self._log(f"  Total archives processed: {self.stats['processed']}", "INFO")
-        self._log(f"  Total files extracted: {self.stats['extracted_files']}", "INFO")
+        self._log(f"  Total files extracted: {self.stats['extracted_files']}", "INFO") # This counts items reported by extractor
         self._log(f"  Successfully extracted: {self.stats['success']}", "INFO")
         self._log(f"  Failed to extract: {self.stats['error']}", "INFO")
         self._log(f"  Total time: {processing_time:.2f} seconds", "INFO")
 
         if self.delete_original and self.stats['freed_size'] > 0:
-            self._log(f"  Space freed: {format_file_size(self.stats['freed_size'])}", "INFO")
+            self._log(f"  Space freed: {format_file_size(self.stats['freed_size'])} by deleting archives", "INFO")
 
-        # 新しい統計情報を収集して記録
+        # The _collect_final_stats will now count files in work_dir,
+        # which after flattening, should represent the true final state.
         try:
             actual_files, actual_folders = await self._collect_final_stats(self.work_dir)
             self.stats['total_extracted_actual_files'] = actual_files
-            self.stats['total_extracted_folders'] = actual_folders
-            self._log(f"  Final actual files count: {actual_files}", "INFO")
-            self._log(f"  Final folders count: {actual_folders}", "INFO")
+            self.stats['total_extracted_folders'] = actual_folders # This will be 0 or low if flattening works
+            self._log(f"  Final actual files count in work_dir: {actual_files}", "INFO")
+            self._log(f"  Final folders count in work_dir: {actual_folders}", "INFO")
         except Exception as e_stats:
             self._log(f"Error collecting final stats: {e_stats}", "ERROR")
-            # エラーが発生しても、主要な解凍処理は完了しているので、統計情報はデフォルト値のままにするか、エラーを示す値を入れる
-            self.stats.setdefault('total_extracted_actual_files', -1) # エラー時は-1など
+            self.stats.setdefault('total_extracted_actual_files', -1)
             self.stats.setdefault('total_extracted_folders', -1)
+
+    async def _flatten_extraction_result_async(self, result_folder_path: Path):
+        """
+        Moves all files from result_folder_path (and its subdirectories)
+        directly into self.work_dir, handling name conflicts with timestamps.
+        Then deletes the result_folder_path.
+        """
+        self._log(f"Flattening results from: {result_folder_path.relative_to(self.work_dir)}", "INFO")
+        moved_files_count = 0
+
+        # Collect all files first to avoid issues if modifying while iterating rglob directly
+        # Ensure paths are absolute for robust operations
+        files_to_move = []
+        if await asyncio.to_thread(result_folder_path.exists) and await asyncio.to_thread(result_folder_path.is_dir):
+            for item_path in result_folder_path.rglob('*'):
+                if await asyncio.to_thread(item_path.is_file):
+                    files_to_move.append(item_path)
+        else:
+            self._log(f"  Result folder {result_folder_path.name} does not exist or is not a directory. Skipping flattening.", "WARNING")
+            return
+
+        if not files_to_move:
+            self._log(f"  No files found within {result_folder_path.name} to move.", "INFO")
+
+        for src_file_path in files_to_move:
+            try:
+                target_filename = src_file_path.name
+                dest_path_in_work_dir = self.work_dir / target_filename
+
+                # Handle potential name conflicts in the work_dir
+                # The avoid_filename_conflict_timestamp function is synchronous, wrap it
+                final_dest_path = await asyncio.to_thread(avoid_filename_conflict_timestamp, dest_path_in_work_dir)
+
+                if final_dest_path != dest_path_in_work_dir:
+                    self._log(f"  Name conflict for {target_filename}. Renaming to {final_dest_path.name} in work_dir.", "INFO")
+
+                # Move the file (shutil.move is synchronous)
+                await asyncio.to_thread(shutil.move, str(src_file_path), str(final_dest_path))
+                moved_files_count += 1
+                self._log(f"  Moved: {src_file_path.relative_to(result_folder_path)} -> {final_dest_path.relative_to(self.work_dir)}", "DEBUG")
+            except Exception as e:
+                self._log(f"  Error moving file {src_file_path.name}: {str(e)}", "ERROR")
+                self.logger.debug(f"Exception details for moving {src_file_path.name}:", exc_info=True)
+
+
+        self._log(f"Moved {moved_files_count} files from {result_folder_path.name} to {self.work_dir.name}.", "INFO")
+
+        # Delete the original result_folder_path
+        if await asyncio.to_thread(result_folder_path.exists) and result_folder_path != self.work_dir : # Ensure not deleting work_dir itself
+            try:
+                self._log(f"Deleting original extraction folder: {result_folder_path.name}", "INFO")
+                await asyncio.to_thread(shutil.rmtree, result_folder_path)
+                self._log(f"  Successfully deleted folder: {result_folder_path.name}", "SUCCESS")
+            except Exception as e:
+                self._log(f"  Error deleting folder {result_folder_path.name}: {str(e)}", "ERROR")
+                self.logger.debug(f"Exception details for deleting {result_folder_path.name}:", exc_info=True)
+        elif result_folder_path == self.work_dir:
+             self._log(f"  Skipping deletion of result folder as it is the working directory itself: {result_folder_path.name}", "WARNING")
 
 
     async def run(self):
