@@ -391,11 +391,10 @@ class RarExtractor(BaseExtractor):
         self.log_method(f"Executing command: {' '.join(cmd)}", "DEBUG")
 
         try:
-            # subprocess.run is sync, run in thread
-            process = await asyncio.to_thread(
-                subprocess.run, cmd, capture_output=True, text=True, check=False,
-                encoding='utf-8', errors='replace'
-            )
+            # subprocess.run is sync, it's called directly here.
+            # The wrapping with asyncio.to_thread is done by the caller in api.py
+            process = subprocess.run(cmd, capture_output=True, text=True, check=False,
+                                   encoding='utf-8', errors='replace')
 
             if process.stdout:
                 self.log_method(f"7z stdout:\n{process.stdout}", "DEBUG")
