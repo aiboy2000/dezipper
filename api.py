@@ -292,6 +292,93 @@ class BatchExtractor:
             self.stats.setdefault('total_extracted_actual_files', -1)
             self.stats.setdefault('total_extracted_folders', -1)
 
+    async def _flatten_work_dir_async(self):
+        """
+        Scans the work_dir for any remaining subdirectories (excluding logs)
+        and moves their contents into work_dir, then deletes the subdirectories.
+        """
+        self._log("Starting final flattening of the working directory...", "INFO")
+        log_dir_name = "batch_extractor_logs" # Hardcoded for now, consider making it dynamic from config if LOG_FILENAME_FORMAT changes structure
+
+        folders_to_process = []
+        # First, list all directories directly under work_dir
+        # os.listdir is sync, Path.iterdir is sync. Wrap it.
+        def list_subdirs():
+            return [d for d in self.work_dir.iterdir() if d.is_dir()]
+
+        subdirectories = await asyncio.to_thread(list_subdirs)
+
+        for subdir in subdirectories:
+            if subdir.name == log_dir_name:
+                self._log(f"  Skipping log directory: {subdir.name}", "DEBUG")
+                continue
+            # Check if it's actually a subdirectory of work_dir, not work_dir itself or parent.
+            # This check is mostly for safety, iterdir on work_dir should give direct children.
+            if self.work_dir in subdir.parents or subdir == self.work_dir:
+                 folders_to_process.append(subdir)
+            else:
+                # This case should ideally not be hit if subdir comes from self.work_dir.iterdir()
+                # and is a directory. This might indicate symlinks or other complex structures
+                # not directly children of work_dir. For now, only process direct children.
+                self._log(f"  Skipping directory not directly under work_dir or complex path: {subdir}", "DEBUG")
+
+
+        if not folders_to_process:
+            self._log("  No user-created subdirectories found in the working directory to flatten.", "INFO")
+            return
+
+        for folder_path in folders_to_process:
+            self._log(f"  Processing folder for flattening: {folder_path.relative_to(self.work_dir.parent)}", "INFO") # Show path relative to parent of work_dir for clarity
+
+            files_in_folder = []
+            # rglob to find all files recursively within this folder_path
+            # Path.rglob is sync, wrap it.
+            def rglob_files():
+                return [item for item in folder_path.rglob('*') if item.is_file()]
+
+            try:
+                files_in_folder = await asyncio.to_thread(rglob_files)
+            except Exception as e_rglob:
+                self._log(f"  Error scanning folder {folder_path.name} for files: {e_rglob}", "ERROR")
+                self.logger.debug(f"Exception details for rglob on {folder_path.name}:", exc_info=True)
+                continue # Skip this folder
+
+            if not files_in_folder:
+                self._log(f"  No files found in {folder_path.name}.", "DEBUG")
+
+            moved_files_this_folder = 0
+            for src_file_path in files_in_folder:
+                try:
+                    target_filename = src_file_path.name
+                    dest_path_in_work_dir = self.work_dir / target_filename
+
+                    final_dest_path = await asyncio.to_thread(avoid_filename_conflict_timestamp, dest_path_in_work_dir)
+
+                    if final_dest_path != dest_path_in_work_dir:
+                        self._log(f"    Name conflict for {target_filename} in work_dir. Renaming to {final_dest_path.name}", "INFO")
+
+                    await asyncio.to_thread(shutil.move, str(src_file_path), str(final_dest_path))
+                    moved_files_this_folder +=1
+                    self._log(f"    Moved: {src_file_path.relative_to(folder_path)} -> {final_dest_path.name} into work_dir", "DEBUG")
+                except Exception as e_move:
+                    self._log(f"    Error moving file {src_file_path.name} from {folder_path.name}: {str(e_move)}", "ERROR")
+                    self.logger.debug(f"Exception details for moving {src_file_path.name} from {folder_path.name}:", exc_info=True)
+
+            if moved_files_this_folder > 0 or not files_in_folder : # Delete if files were moved OR if it was empty to begin with
+                if await asyncio.to_thread(folder_path.exists): # Check again before deleting
+                    try:
+                        self._log(f"  Deleting processed folder: {folder_path.name}", "INFO")
+                        await asyncio.to_thread(shutil.rmtree, folder_path)
+                        self._log(f"    Successfully deleted folder: {folder_path.name}", "SUCCESS")
+                    except Exception as e_del:
+                        self._log(f"    Error deleting folder {folder_path.name}: {str(e_del)}", "ERROR")
+                        self.logger.debug(f"Exception details for deleting {folder_path.name}:", exc_info=True)
+                else:
+                     self._log(f"  Folder {folder_path.name} no longer exists, skipping deletion.", "DEBUG")
+
+        self._log("Final flattening of working directory complete.", "SUCCESS")
+
+
     async def _flatten_extraction_result_async(self, result_folder_path: Path):
         """
         Moves all files from result_folder_path (and its subdirectories)
@@ -379,7 +466,28 @@ class BatchExtractor:
 
         try:
             await self.process_all_files_async()
-            return True, "Extraction process completed."
+            # process_all_files_async logs its own stats internally before it finishes.
+
+            # New step: Final flattening of the work_dir itself
+            self._log("Proceeding to final work_dir flattening stage.", "INFO")
+            await self._flatten_work_dir_async()
+
+            # Re-collect and log final stats after work_dir flattening
+            try:
+                self._log("Collecting final statistics after work_dir flattening...", "INFO")
+                actual_files, actual_folders = await self._collect_final_stats(self.work_dir)
+                self.stats['total_extracted_actual_files'] = actual_files
+                self.stats['total_extracted_folders'] = actual_folders
+                self._log(f"  Post-flattening final actual files count in work_dir: {actual_files}", "INFO")
+                self._log(f"  Post-flattening final folders count in work_dir: {actual_folders}", "INFO")
+            except Exception as e_stats_final:
+                self._log(f"Error collecting post-flattening final stats: {e_stats_final}", "ERROR")
+                # Keep previous stats if this fails, or set to error indicator
+                self.stats.setdefault('total_extracted_actual_files', -2) # Use -2 to differentiate from earlier -1
+                self.stats.setdefault('total_extracted_folders', -2)
+
+
+            return True, "Extraction and flattening process completed."
         except KeyboardInterrupt:
             self._log("User interrupted the operation.", "WARNING")
             return False, "Operation interrupted by user."
